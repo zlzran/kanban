@@ -71,6 +71,32 @@ interface StoredFocus {
   running: boolean
 }
 
+interface StoredThemePalette {
+  color: string
+  projectBrightness: number
+  boardBrightness: number
+  cardBrightness: number
+}
+
+interface StoredThemeSettings {
+  activeThemeId: string
+  customDraft: StoredThemePalette
+  themes: Array<StoredThemePalette & { id: string; title: string }>
+}
+
+interface StoredShortcutSettings {
+  inbox: string
+  projectTabs: string
+  planTabs: string
+  boards: string
+  tags: string
+  settings: string
+  plan: string
+  search: string
+  undo: string
+  redo: string
+}
+
 interface StoredState {
   version: 1
   projects: StoredProject[]
@@ -78,12 +104,59 @@ interface StoredState {
   boards: StoredBoard[]
   focus: StoredFocus | null
   lastProjectId: string | null
+  lastView: 'boards' | 'inbox' | 'flagged' | 'overdue' | 'tags' | 'statistics' | 'settings'
   boardDisplaySettings: Record<string, 'all' | 'in_progress' | 'staged' | 'done'>
-  tagViewSettings: Record<string, { enabled: boolean; categoryTagId: string; statuses: { staged: boolean; in_progress: boolean; done: boolean; deleted: boolean } }>
-  displaySettings: { boardColumns: number | 'auto'; boardWidth: 'narrow' | 'medium' | 'wide'; boardHeight: 'small' | 'medium' | 'large'; fontSize: 'small' | 'medium' | 'large'; dockTimerEnabled: boolean }
-  inboxSettings: { in_progress: boolean; done: boolean; deleted: boolean }
+  tagViewSettings: Record<string, {
+    activeViewId: string | null
+    views: Array<{ id: string; pinned: boolean; categoryTagId: string; statuses: { staged: boolean; in_progress: boolean; done: boolean; deleted: boolean } }>
+  }>
+  themeSettings: StoredThemeSettings
+  displaySettings: { boardColumns: number | 'auto'; boardWidth: 'auto' | 'narrow' | 'medium' | 'wide'; boardHeight: 'small' | 'medium' | 'large'; fontSize: 'small' | 'medium' | 'large'; dockTimerEnabled: boolean }
+  inboxSettings: { staged: boolean; in_progress: boolean; done: boolean; deleted: boolean }
   focusSettings: { durationMinutes: number }
-  shortcuts: { inbox: string }
+  shortcuts: StoredShortcutSettings
+}
+
+const DEFAULT_THEME_PALETTE: StoredThemePalette = {
+  color: '#b3b3b3', projectBrightness: 94, boardBrightness: 83, cardBrightness: 94
+}
+
+const DEFAULT_SHORTCUTS: StoredShortcutSettings = {
+  inbox: 'CommandOrControl+Shift+I', projectTabs: 'Command+1', planTabs: 'Command+1',
+  boards: 'Command+Shift+P', tags: 'Command+Shift+T', settings: 'Command+Shift+S',
+  plan: 'Command+Shift+A', search: 'Command+Shift+F', undo: 'Command+Z', redo: 'Command+Shift+Z'
+}
+
+function normalizeShortcuts(value: unknown): StoredShortcutSettings {
+  const candidate = value && typeof value === 'object' ? value as Partial<StoredShortcutSettings> : {}
+  return Object.fromEntries(Object.entries(DEFAULT_SHORTCUTS).map(([key, fallback]) => [
+    key, typeof candidate[key as keyof StoredShortcutSettings] === 'string' && candidate[key as keyof StoredShortcutSettings]
+      ? candidate[key as keyof StoredShortcutSettings] : fallback
+  ])) as unknown as StoredShortcutSettings
+}
+
+function normalizeThemePalette(value: unknown): StoredThemePalette {
+  const candidate = value && typeof value === 'object' ? value as Partial<StoredThemePalette> : {}
+  const brightness = (raw: unknown, fallback: number): number => Math.min(100, Math.max(60, Number(raw) || fallback))
+  return {
+    color: typeof candidate.color === 'string' && /^#[0-9a-f]{6}$/i.test(candidate.color) ? candidate.color.toLowerCase() : DEFAULT_THEME_PALETTE.color,
+    projectBrightness: brightness(candidate.projectBrightness, DEFAULT_THEME_PALETTE.projectBrightness),
+    boardBrightness: brightness(candidate.boardBrightness, DEFAULT_THEME_PALETTE.boardBrightness),
+    cardBrightness: brightness(candidate.cardBrightness, DEFAULT_THEME_PALETTE.cardBrightness)
+  }
+}
+
+function normalizeThemeSettings(value: unknown): StoredThemeSettings {
+  const candidate = value && typeof value === 'object' ? value as Partial<StoredThemeSettings> : {}
+  const themes = Array.isArray(candidate.themes) ? candidate.themes.flatMap((raw) => {
+    if (!raw || typeof raw !== 'object') return []
+    const theme = raw as Partial<StoredThemeSettings['themes'][number]>
+    if (typeof theme.id !== 'string' || !theme.id || typeof theme.title !== 'string' || !theme.title.trim()) return []
+    return [{ id: theme.id, title: theme.title.trim().slice(0, 30), ...normalizeThemePalette(theme) }]
+  }) : []
+  const requested = typeof candidate.activeThemeId === 'string' ? candidate.activeThemeId : 'default'
+  const activeThemeId = requested === 'default' || requested === 'custom' || themes.some((theme) => theme.id === requested) ? requested : 'default'
+  return { activeThemeId, customDraft: normalizeThemePalette(candidate.customDraft), themes }
 }
 
 interface BoardRow {
@@ -340,13 +413,14 @@ function isStoredState(value: unknown): value is StoredState {
 function normalizeState(value: StoredState): StoredState {
   const boardColumns = value.displaySettings?.boardColumns === 'auto'
     ? 'auto' as const : Math.min(8, Math.max(3, Number(value.displaySettings?.boardColumns) || 4))
-  const boardWidth = ['narrow', 'medium', 'wide'].includes(value.displaySettings?.boardWidth) ? value.displaySettings.boardWidth : 'medium'
+  const requestedBoardWidth = ['auto', 'narrow', 'medium', 'wide'].includes(value.displaySettings?.boardWidth) ? value.displaySettings.boardWidth : 'medium'
+  const boardWidth = boardColumns === 'auto' && requestedBoardWidth === 'auto' ? 'medium' : requestedBoardWidth
   const boardHeight = value.displaySettings?.boardHeight === 'small' || value.displaySettings?.boardHeight === 'large'
     ? value.displaySettings.boardHeight : 'medium'
   const fontSize = ['small', 'medium', 'large'].includes(value.displaySettings?.fontSize) ? value.displaySettings.fontSize : 'medium'
   const dockTimerEnabled = value.displaySettings?.dockTimerEnabled !== false
   const durationMinutes = Math.min(120, Math.max(10, Number(value.focusSettings?.durationMinutes) || 60))
-  const shortcuts = { inbox: value.shortcuts?.inbox || 'CommandOrControl+Shift+I' }
+  const shortcuts = normalizeShortcuts(value.shortcuts)
   const boards: StoredBoard[] = value.boards.map((board) => {
     const status = board.status === 'archived' || board.status === 'deleted' ? board.status : 'active'
     return {
@@ -370,14 +444,17 @@ function normalizeState(value: StoredState): StoredState {
     boards,
     boardDisplaySettings: value.boardDisplaySettings && typeof value.boardDisplaySettings === 'object' ? value.boardDisplaySettings : {},
     tagViewSettings: value.tagViewSettings && typeof value.tagViewSettings === 'object' ? value.tagViewSettings : {},
+    themeSettings: normalizeThemeSettings(value.themeSettings),
     projects: Array.isArray(value.projects) ? value.projects.map((project) => ({ ...project, archivedAt: project.archivedAt || null })) : [],
     tags: Array.isArray(value.tags) ? value.tags.map((tag) => ({ ...tag, deletedAt: tag.deletedAt || null })) : [],
     lastProjectId: typeof value.lastProjectId === 'string' && value.lastProjectId ? value.lastProjectId : null,
+    lastView: ['boards', 'inbox', 'flagged', 'overdue', 'tags', 'statistics', 'settings'].includes(value.lastView) ? value.lastView : 'boards',
     displaySettings: { boardColumns, boardWidth, boardHeight, fontSize, dockTimerEnabled },
     inboxSettings: {
+      staged: value.inboxSettings?.staged === true,
       in_progress: value.inboxSettings?.in_progress !== false,
       done: value.inboxSettings?.done === true,
-      deleted: value.inboxSettings?.deleted === true
+      deleted: false
     },
     focusSettings: { durationMinutes }, shortcuts
   }
@@ -504,13 +581,17 @@ function saveStateTo(target: DatabaseSync, state: StoredState): void {
       ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at
     `).run(JSON.stringify(state.tagViewSettings), now)
     target.prepare(`
+      INSERT INTO app_state (key, value_json, updated_at) VALUES ('theme_settings', ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at
+    `).run(JSON.stringify(state.themeSettings), now)
+    target.prepare(`
       INSERT INTO app_state (key, value_json, updated_at) VALUES ('shortcuts', ?, ?)
       ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at
     `).run(JSON.stringify(state.shortcuts), now)
     target.prepare(`
       INSERT INTO app_state (key, value_json, updated_at) VALUES ('navigation', ?, ?)
       ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at
-    `).run(JSON.stringify({ lastProjectId: state.lastProjectId || null }), now)
+    `).run(JSON.stringify({ lastProjectId: state.lastProjectId || null, lastView: state.lastView }), now)
     target.prepare(`
       INSERT INTO app_state (key, value_json, updated_at) VALUES ('focus_settings', ?, ?)
       ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at
@@ -572,27 +653,31 @@ export function loadBoardState(): StoredState {
   const displaySettingsRow = target.prepare("SELECT value_json FROM app_state WHERE key = 'display_settings'").get() as { value_json: string } | undefined
   const boardDisplaySettingsRow = target.prepare("SELECT value_json FROM app_state WHERE key = 'board_display_settings'").get() as { value_json: string } | undefined
   const tagViewSettingsRow = target.prepare("SELECT value_json FROM app_state WHERE key = 'tag_view_settings'").get() as { value_json: string } | undefined
+  const themeSettingsRow = target.prepare("SELECT value_json FROM app_state WHERE key = 'theme_settings'").get() as { value_json: string } | undefined
   const shortcutsRow = target.prepare("SELECT value_json FROM app_state WHERE key = 'shortcuts'").get() as { value_json: string } | undefined
   const navigationRow = target.prepare("SELECT value_json FROM app_state WHERE key = 'navigation'").get() as { value_json: string } | undefined
   const focusSettingsRow = target.prepare("SELECT value_json FROM app_state WHERE key = 'focus_settings'").get() as { value_json: string } | undefined
   const inboxSettingsRow = target.prepare("SELECT value_json FROM app_state WHERE key = 'inbox_settings'").get() as { value_json: string } | undefined
   let focus: StoredFocus | null = null
   let boardColumns: number | 'auto' = 4
-  let boardWidth: 'narrow' | 'medium' | 'wide' = 'medium'
+  let boardWidth: 'auto' | 'narrow' | 'medium' | 'wide' = 'medium'
   let boardHeight: 'small' | 'medium' | 'large' = 'medium'
   let fontSize: 'small' | 'medium' | 'large' = 'medium'
   let dockTimerEnabled = true
   let boardDisplaySettings: StoredState['boardDisplaySettings'] = {}
   let tagViewSettings: StoredState['tagViewSettings'] = {}
-  let inboxShortcut = 'CommandOrControl+Shift+I'
+  let themeSettings = normalizeThemeSettings(null)
+  let shortcuts = normalizeShortcuts(null)
   let lastProjectId: string | null = navigationRow ? null : projectRows.find((row) => !row.deleted_at)?.id || null
+  let lastView: StoredState['lastView'] = 'boards'
   let focusDurationMinutes = 60
   try { focus = focusRow ? JSON.parse(focusRow.value_json) as StoredFocus : null } catch { focus = null }
   try {
     const stored = displaySettingsRow ? JSON.parse(displaySettingsRow.value_json) as { boardColumns?: unknown; boardWidth?: unknown; boardHeight?: unknown; fontSize?: unknown; dockTimerEnabled?: unknown } : null
     boardColumns = stored?.boardColumns === 'auto' ? 'auto' : Math.min(8, Math.max(3, Number(stored?.boardColumns) || 4))
     const width = (stored as { boardWidth?: unknown } | null)?.boardWidth
-    if (width === 'narrow' || width === 'medium' || width === 'wide') boardWidth = width
+    if (width === 'auto' || width === 'narrow' || width === 'medium' || width === 'wide') boardWidth = width
+    if (boardColumns === 'auto' && boardWidth === 'auto') boardWidth = 'medium'
     const height = stored?.boardHeight
     if (height === 'small' || height === 'medium' || height === 'large') boardHeight = height
     const size = stored?.fontSize
@@ -600,9 +685,8 @@ export function loadBoardState(): StoredState {
     dockTimerEnabled = stored?.dockTimerEnabled !== false
   } catch { boardColumns = 4 }
   try {
-    const stored = shortcutsRow ? JSON.parse(shortcutsRow.value_json) as { inbox?: unknown } : null
-    if (typeof stored?.inbox === 'string' && stored.inbox) inboxShortcut = stored.inbox
-  } catch { inboxShortcut = 'CommandOrControl+Shift+I' }
+    shortcuts = normalizeShortcuts(shortcutsRow ? JSON.parse(shortcutsRow.value_json) : null)
+  } catch { shortcuts = normalizeShortcuts(null) }
   try {
     const stored = boardDisplaySettingsRow ? JSON.parse(boardDisplaySettingsRow.value_json) as Record<string, unknown> : null
     if (stored) boardDisplaySettings = Object.fromEntries(Object.entries(stored).filter((entry): entry is [string, 'all' | 'in_progress' | 'staged' | 'done'] =>
@@ -612,47 +696,80 @@ export function loadBoardState(): StoredState {
     const stored = tagViewSettingsRow ? JSON.parse(tagViewSettingsRow.value_json) as Record<string, unknown> : null
     if (stored) tagViewSettings = Object.fromEntries(Object.entries(stored).flatMap(([projectId, raw]) => {
       if (!raw || typeof raw !== 'object') return []
-      const value = raw as { enabled?: unknown; categoryTagId?: unknown; statuses?: Partial<Record<'staged' | 'in_progress' | 'done' | 'deleted', unknown>> }
-      if (typeof value.categoryTagId !== 'string' || !value.categoryTagId) return []
-      return [[projectId, {
-        enabled: value.enabled === true,
-        categoryTagId: value.categoryTagId,
-        statuses: {
-          staged: value.statuses?.staged === true,
-          in_progress: value.statuses?.in_progress !== false,
-          done: value.statuses?.done === true,
-          deleted: value.statuses?.deleted === true
+      const value = raw as {
+        activeViewId?: unknown
+        views?: unknown
+        enabled?: unknown
+        categoryTagId?: unknown
+        statuses?: Partial<Record<'staged' | 'in_progress' | 'done' | 'deleted', unknown>>
+      }
+      const normalizeView = (candidate: unknown, fallbackId: string): StoredState['tagViewSettings'][string]['views'][number] | null => {
+        if (!candidate || typeof candidate !== 'object') return null
+        const view = candidate as { id?: unknown; pinned?: unknown; categoryTagId?: unknown; statuses?: Partial<Record<'staged' | 'in_progress' | 'done' | 'deleted', unknown>> }
+        if (typeof view.categoryTagId !== 'string' || !view.categoryTagId) return null
+        return {
+          id: typeof view.id === 'string' && view.id ? view.id : fallbackId,
+          pinned: view.pinned === true,
+          categoryTagId: view.categoryTagId,
+          statuses: {
+            staged: view.statuses?.staged === true,
+            in_progress: view.statuses?.in_progress !== false,
+            done: view.statuses?.done === true,
+            deleted: view.statuses?.deleted === true
+          }
         }
+      }
+      const views = Array.isArray(value.views)
+        ? value.views.map((view, index) => normalizeView(view, `view-${projectId}-${index}`)).filter((view): view is NonNullable<typeof view> => Boolean(view))
+        : []
+      if (!views.length) {
+        const legacy = normalizeView(value, `view-${projectId}-legacy`)
+        if (legacy) views.push(legacy)
+      }
+      if (!views.length) return []
+      const requestedActiveId = typeof value.activeViewId === 'string' ? value.activeViewId : value.enabled === true ? views[0].id : null
+      return [[projectId, {
+        activeViewId: views.some((view) => view.id === requestedActiveId) ? requestedActiveId : null,
+        views
       }]]
     }))
   } catch { tagViewSettings = {} }
   try {
-    const stored = navigationRow ? JSON.parse(navigationRow.value_json) as { lastProjectId?: unknown } : null
+    themeSettings = normalizeThemeSettings(themeSettingsRow ? JSON.parse(themeSettingsRow.value_json) : null)
+  } catch { themeSettings = normalizeThemeSettings(null) }
+  try {
+    const stored = navigationRow ? JSON.parse(navigationRow.value_json) as { lastProjectId?: unknown; lastView?: unknown } : null
     if (typeof stored?.lastProjectId === 'string' && stored.lastProjectId) lastProjectId = stored.lastProjectId
-  } catch { lastProjectId = null }
+    if (stored && typeof stored.lastView === 'string' && ['boards', 'inbox', 'flagged', 'overdue', 'tags', 'statistics', 'settings'].includes(stored.lastView)) {
+      lastView = stored.lastView as StoredState['lastView']
+    }
+  } catch { lastProjectId = null; lastView = 'boards' }
   try {
     const stored = focusSettingsRow ? JSON.parse(focusSettingsRow.value_json) as { durationMinutes?: unknown } : null
     focusDurationMinutes = Math.min(120, Math.max(10, Number(stored?.durationMinutes) || 60))
   } catch { focusDurationMinutes = 60 }
-  let inboxSettings = { in_progress: true, done: false, deleted: false }
+  let inboxSettings = { staged: false, in_progress: true, done: false, deleted: false }
   try {
-    const stored = inboxSettingsRow ? JSON.parse(inboxSettingsRow.value_json) as { in_progress?: unknown; done?: unknown; deleted?: unknown } : null
+    const stored = inboxSettingsRow ? JSON.parse(inboxSettingsRow.value_json) as { staged?: unknown; in_progress?: unknown; done?: unknown; deleted?: unknown } : null
     if (stored) inboxSettings = {
+      staged: stored.staged === true,
       in_progress: stored.in_progress !== false,
       done: stored.done === true,
-      deleted: stored.deleted === true
+      deleted: false
     }
-  } catch { inboxSettings = { in_progress: true, done: false, deleted: false } }
+  } catch { inboxSettings = { staged: false, in_progress: true, done: false, deleted: false } }
   return {
     version: 1,
     focus,
     lastProjectId,
+    lastView,
     boardDisplaySettings,
     tagViewSettings,
+    themeSettings,
     displaySettings: { boardColumns, boardWidth, boardHeight, fontSize, dockTimerEnabled },
     inboxSettings,
     focusSettings: { durationMinutes: focusDurationMinutes },
-    shortcuts: { inbox: inboxShortcut },
+    shortcuts,
     projects: projectRows.map((row) => ({
       id: row.id, title: row.title, color: row.color, sort: row.sort,
       createdAt: row.created_at, updatedAt: row.updated_at, deletedAt: row.deleted_at, archivedAt: row.archived_at

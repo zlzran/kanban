@@ -1,6 +1,6 @@
 import { dirname, extname, join } from 'node:path'
 import { existsSync } from 'node:fs'
-import { app, BrowserWindow, dialog, globalShortcut, ipcMain, Menu, nativeImage, shell } from 'electron'
+import { app, BrowserWindow, dialog, globalShortcut, ipcMain, Menu, nativeImage, shell, Tray } from 'electron'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
 import {
   addQuickInboxCard,
@@ -18,9 +18,89 @@ app.setName('Vistask')
 
 let mainWindow: BrowserWindow | null = null
 let quickInboxWindow: BrowserWindow | null = null
+let quickInboxOrigin: { mainVisible: boolean; mainFocused: boolean; mainMinimized: boolean } | null = null
+let appQuitting = false
 let currentInboxShortcut = 'CommandOrControl+Shift+I'
 const appIconPath = join(app.getAppPath(), 'build/icon.png')
 type DockFocusState = 'none' | 'running' | 'paused'
+interface StatusBarFocus { running: boolean; endsAt: number; remainingMs: number }
+let statusBarTray: Tray | null = null
+let statusBarFocus: StatusBarFocus | null = null
+let statusBarTimer: NodeJS.Timeout | null = null
+
+function createStatusBarIcon(): Electron.NativeImage {
+  const packagedIconPath = join(process.resourcesPath, 'icon.icns')
+  const iconPath = existsSync(appIconPath) ? appIconPath : packagedIconPath
+  if (existsSync(iconPath)) {
+    const appIcon = nativeImage.createFromPath(iconPath)
+    if (!appIcon.isEmpty()) return appIcon.resize({ width: 18, height: 18 })
+  }
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18"><g fill="none" stroke="#000" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4.2 7.2c-1 1.1-1.5 2.5-1.3 4 .3 2.7 2.7 4.7 6.1 4.7s5.8-2 6.1-4.7c.2-1.5-.3-2.9-1.3-4"/><path d="m9 7.3-2.4 1.2.7-2.4-2.4-.7 2.5-.7-1.2-2 2.5 1L9.4 1l.8 2.7 2.5-1-1.3 2 2.6.7-2.5.7.7 2.4L9 7.3Z"/></g></svg>`
+  const icon = nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`).resize({ width: 18, height: 18 })
+  icon.setTemplateImage(true)
+  return icon
+}
+
+function showMainWindow(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow()
+    return
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+  if (process.platform === 'darwin') app.focus({ steal: true })
+}
+
+function formatStatusBarDuration(milliseconds: number): string {
+  const seconds = Math.max(0, Math.ceil(milliseconds / 1000))
+  const minutes = Math.floor(seconds / 60)
+  return `${String(minutes).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`
+}
+
+function updateStatusBar(): void {
+  if (process.platform !== 'darwin') return
+  if (!statusBarFocus) {
+    statusBarTray?.destroy()
+    statusBarTray = null
+    return
+  }
+  if (!statusBarTray || statusBarTray.isDestroyed()) {
+    statusBarTray = new Tray(createStatusBarIcon())
+    statusBarTray.on('click', showMainWindow)
+  }
+  const remainingMs = statusBarFocus.running
+    ? Math.max(0, statusBarFocus.endsAt - Date.now())
+    : Math.max(0, statusBarFocus.remainingMs)
+  if (statusBarFocus.running && remainingMs <= 0) {
+    statusBarFocus = null
+    statusBarTray.destroy()
+    statusBarTray = null
+    return
+  }
+  const time = formatStatusBarDuration(remainingMs)
+  statusBarTray.setTitle(` ${statusBarFocus.running ? '' : 'Ⅱ '}${time}`)
+  statusBarTray.setToolTip(`Vistask 番茄钟 · ${statusBarFocus.running ? '正在推进' : '已暂停'} · ${time}`)
+  statusBarTray.setContextMenu(Menu.buildFromTemplate([
+    statusBarFocus.running
+      ? { label: '暂停推进', click: () => performDockFocusAction('pause') }
+      : { label: '继续推进', click: () => performDockFocusAction('resume') },
+    { type: 'separator' },
+    { label: '显示 Vistask', click: showMainWindow }
+  ]))
+}
+
+function syncStatusBarFocus(value: unknown): void {
+  if (!value || typeof value !== 'object') {
+    statusBarFocus = null
+    updateStatusBar()
+    return
+  }
+  const focus = value as Partial<StatusBarFocus>
+  if (typeof focus.running !== 'boolean' || !Number.isFinite(focus.endsAt) || !Number.isFinite(focus.remainingMs)) return
+  statusBarFocus = { running: focus.running, endsAt: Number(focus.endsAt), remainingMs: Number(focus.remainingMs) }
+  updateStatusBar()
+}
 
 function setDockFocusMenu(state: DockFocusState): void {
   if (process.platform !== 'darwin' || !app.dock) return
@@ -36,6 +116,13 @@ function performDockFocusAction(action: 'pause' | 'resume'): void {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('focus:dock-action', action)
     setDockFocusMenu(action === 'pause' ? 'paused' : 'running')
+    if (statusBarFocus) {
+      const now = Date.now()
+      statusBarFocus = action === 'pause'
+        ? { ...statusBarFocus, remainingMs: Math.max(0, statusBarFocus.endsAt - now), running: false }
+        : { ...statusBarFocus, endsAt: now + Math.max(0, statusBarFocus.remainingMs), running: true }
+      updateStatusBar()
+    }
     return
   }
   const state = loadBoardState()
@@ -49,6 +136,7 @@ function performDockFocusAction(action: 'pause' | 'resume'): void {
   } else return
   saveBoardState(state)
   setDockFocusMenu(state.focus.running ? 'running' : 'paused')
+  syncStatusBarFocus(state.focus)
 }
 
 function registerInboxShortcut(accelerator: string): { success: boolean; error?: string } {
@@ -70,7 +158,40 @@ function openInbox(): void {
     quickInboxWindow.focus()
     return
   }
+  quickInboxOrigin = {
+    mainVisible: Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()),
+    mainFocused: Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()),
+    mainMinimized: Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isMinimized())
+  }
   createQuickInboxWindow()
+}
+
+function restoreAfterQuickInbox(): void {
+  const origin = quickInboxOrigin
+  quickInboxOrigin = null
+  if (!origin || appQuitting) return
+  const window = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null
+  if (!window) {
+    if (process.platform === 'darwin') app.hide()
+    return
+  }
+  if (origin.mainMinimized) {
+    window.minimize()
+    return
+  }
+  if (!origin.mainVisible) {
+    window.hide()
+    if (process.platform === 'darwin') app.hide()
+    return
+  }
+  if (origin.mainFocused) {
+    window.show()
+    window.focus()
+    return
+  }
+  // The shortcut came from another application. Keep Vistask from taking over
+  // after the capture window closes; macOS then returns focus to that app.
+  if (process.platform === 'darwin') app.hide()
 }
 
 function createQuickInboxWindow(): void {
@@ -101,7 +222,10 @@ function createQuickInboxWindow(): void {
     window.focus()
     if (process.platform === 'darwin') app.focus({ steal: true })
   })
-  window.on('closed', () => { if (quickInboxWindow === window) quickInboxWindow = null })
+  window.on('closed', () => {
+    if (quickInboxWindow === window) quickInboxWindow = null
+    restoreAfterQuickInbox()
+  })
   if (is.dev && process.env.ELECTRON_RENDERER_URL) {
     void window.loadURL(`${process.env.ELECTRON_RENDERER_URL}?mode=quick-inbox`)
   } else {
@@ -158,6 +282,8 @@ app.whenReady().then(async () => {
   currentInboxShortcut = initialState.shortcuts.inbox
   registerInboxShortcut(currentInboxShortcut)
   setDockFocusMenu(initialState.focus ? initialState.focus.running ? 'running' : 'paused' : 'none')
+  syncStatusBarFocus(initialState.focus)
+  statusBarTimer = setInterval(updateStatusBar, 1000)
 
   app.on('browser-window-created', (_, window) => optimizer.watchWindowShortcuts(window))
 
@@ -184,6 +310,10 @@ app.whenReady().then(async () => {
     if (state !== 'none' && state !== 'running' && state !== 'paused') return false
     setDockFocusMenu(state)
     return true
+  })
+  ipcMain.handle('focus:set-status-bar', (_event, focus: unknown) => {
+    syncStatusBarFocus(focus)
+    return process.platform === 'darwin' && Boolean(statusBarTray && !statusBarTray.isDestroyed())
   })
 
   ipcMain.handle('shortcut:capture-start', () => {
@@ -220,6 +350,7 @@ app.whenReady().then(async () => {
     const accelerator = candidate?.shortcuts?.inbox
     if (typeof accelerator === 'string' && accelerator) registerInboxShortcut(accelerator)
     setDockFocusMenu(candidate?.focus ? candidate.focus.running === true ? 'running' : 'paused' : 'none')
+    syncStatusBarFocus(candidate?.focus)
     return saved
   })
 
@@ -270,7 +401,13 @@ app.whenReady().then(async () => {
   })
 })
 
+app.on('before-quit', () => { appQuitting = true })
+
 app.on('will-quit', () => {
+  if (statusBarTimer) clearInterval(statusBarTimer)
+  statusBarTimer = null
+  statusBarTray?.destroy()
+  statusBarTray = null
   globalShortcut.unregisterAll()
   closeStorage()
 })

@@ -1,6 +1,7 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { LineChartOutlined, MailOutlined, TagOutlined, TagsOutlined } from '@ant-design/icons'
+import { FormOutlined, LineChartOutlined, MailOutlined, ProjectOutlined, PushpinOutlined, SubnodeOutlined, TagOutlined, TagsOutlined } from '@ant-design/icons'
+import { Timeline } from 'antd'
 
 const STATUS_LABELS: Record<CardStatus, string> = {
   staged: '已放弃', in_progress: '进行中', done: '已完成', deleted: '已删除'
@@ -13,12 +14,113 @@ const COLORS = ['#5b8def', '#9b7de5', '#ec6f8c', '#e7a33e', '#42a57c', '#4aa8b8'
 const BOARD_HEIGHT_PIXELS = { small: 300, medium: 430, large: 560 } as const
 const FOCUS_CREDIT_THRESHOLD = 1 / 5
 type BoardParentDisplay = 'all' | 'in_progress' | 'staged' | 'done'
+type AppView = 'boards' | 'inbox' | 'flagged' | 'overdue' | 'tags' | 'statistics' | 'settings'
 const DEFAULT_FILTER: BoardFilter = { staged: false, in_progress: true, done: false, deleted: false }
 const INBOX_FILTER: BoardFilter = { staged: true, in_progress: true, done: false, deleted: false }
 const INBOX_BOARD_ID = '__cardex_inbox__'
 const INBOX_BOARD_TITLE = '__CARDEX_INBOX__'
 const LEGACY_DEFAULT_BOARDS = ['收集箱', '本周', '进行中', '等待中', '已完成']
+const DEFAULT_THEME_PALETTE: ThemePalette = {
+  color: '#b3b3b3', projectBrightness: 94, boardBrightness: 83, cardBrightness: 94
+}
+const DEFAULT_SHORTCUTS: ShortcutSettings = {
+  inbox: 'CommandOrControl+Shift+I', projectTabs: 'Command+1', planTabs: 'Command+1',
+  boards: 'Command+Shift+P', tags: 'Command+Shift+T', settings: 'Command+Shift+S',
+  plan: 'Command+Shift+A', search: 'Command+Shift+F', undo: 'Command+Z', redo: 'Command+Shift+Z'
+}
+type AppShortcutKey = Exclude<keyof ShortcutSettings, 'inbox'>
 const uid = (): string => crypto.randomUUID()
+
+type UndoableState = Pick<BoardState,
+  'projects' | 'tags' | 'boards' | 'boardDisplaySettings' | 'tagViewSettings'
+  | 'themeSettings' | 'displaySettings' | 'inboxSettings' | 'focusSettings' | 'shortcuts'>
+
+interface ReversibleOperation {
+  id: string
+  description: string
+  mergeKey: string
+  forward: UndoableState
+  inverse: UndoableState
+  createdAt: number
+}
+
+function takeUndoSnapshot(state: BoardState): UndoableState {
+  return structuredClone({
+    projects: state.projects,
+    tags: state.tags,
+    boards: state.boards,
+    boardDisplaySettings: state.boardDisplaySettings,
+    tagViewSettings: state.tagViewSettings,
+    themeSettings: state.themeSettings,
+    displaySettings: state.displaySettings,
+    inboxSettings: state.inboxSettings,
+    focusSettings: state.focusSettings,
+    shortcuts: state.shortcuts
+  })
+}
+
+function applyUndoSnapshot(current: BoardState, snapshot: UndoableState): BoardState {
+  const currentCards = new Map(current.boards.flatMap((board) => board.cards.map((card) => [card.id, card] as const)))
+  return {
+    ...current,
+    ...structuredClone(snapshot),
+    boards: structuredClone(snapshot.boards).map((board) => ({
+      ...board,
+      cards: board.cards.map((card) => {
+        const currentCard = currentCards.get(card.id)
+        return currentCard ? { ...card, focusMinutes: currentCard.focusMinutes, pomodoroCount: currentCard.pomodoroCount } : card
+      })
+    }))
+  }
+}
+
+function sameUndoSnapshot(left: UndoableState, right: UndoableState): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function describeOperation(before: UndoableState, after: UndoableState): string {
+  if (JSON.stringify(before.projects) !== JSON.stringify(after.projects)) return '修改项目'
+  if (JSON.stringify(before.tags) !== JSON.stringify(after.tags)) return '修改 Tag'
+  if (JSON.stringify(before.boards) !== JSON.stringify(after.boards)) {
+    const beforeBoards = new Map(before.boards.map((board) => [board.id, board]))
+    const afterBoards = new Map(after.boards.map((board) => [board.id, board]))
+    const beforeCards = new Map(before.boards.flatMap((board) => board.cards.map((card) => [card.id, card] as const)))
+    const afterCards = new Map(after.boards.flatMap((board) => board.cards.map((card) => [card.id, card] as const)))
+    if (beforeCards.size !== afterCards.size) return afterCards.size > beforeCards.size ? '添加卡片' : '删除卡片'
+    if ([...beforeCards.keys()].some((id) => !afterCards.has(id))) return '修改卡片'
+    if ([...beforeCards].some(([id, card]) => JSON.stringify(card) !== JSON.stringify(afterCards.get(id)))) return '修改卡片'
+    if (beforeBoards.size !== afterBoards.size) return afterBoards.size > beforeBoards.size ? '添加看板' : '删除看板'
+    if ([...beforeBoards].some(([id, board]) => JSON.stringify({ ...board, cards: [] }) !== JSON.stringify({ ...afterBoards.get(id), cards: [] }))) return '修改看板'
+    return '调整顺序'
+  }
+  if (JSON.stringify(before.tagViewSettings) !== JSON.stringify(after.tagViewSettings)) return '修改标签视图'
+  if (JSON.stringify(before.themeSettings) !== JSON.stringify(after.themeSettings)) return '修改主题'
+  if (JSON.stringify(before.boardDisplaySettings) !== JSON.stringify(after.boardDisplaySettings)) return '修改卡片状态筛选'
+  return '修改设置'
+}
+
+function operationMergeKey(before: UndoableState, after: UndoableState): string {
+  const changedIds = <T extends { id: string }>(left: T[], right: T[]): string[] => {
+    const leftMap = new Map(left.map((item) => [item.id, item]))
+    const rightMap = new Map(right.map((item) => [item.id, item]))
+    return [...new Set([...leftMap.keys(), ...rightMap.keys()])]
+      .filter((id) => JSON.stringify(leftMap.get(id)) !== JSON.stringify(rightMap.get(id))).sort()
+  }
+  const projectIds = changedIds(before.projects, after.projects)
+  if (projectIds.length) return `projects:${projectIds.join(',')}`
+  const tagIds = changedIds(before.tags, after.tags)
+  if (tagIds.length) return `tags:${tagIds.join(',')}`
+  const beforeCards = before.boards.flatMap((board) => board.cards)
+  const afterCards = after.boards.flatMap((board) => board.cards)
+  const cardIds = changedIds(beforeCards, afterCards)
+  if (cardIds.length) return `cards:${cardIds.join(',')}`
+  const boardIds = changedIds(before.boards.map((board) => ({ ...board, cards: [] })), after.boards.map((board) => ({ ...board, cards: [] })))
+  if (boardIds.length) return `boards:${boardIds.join(',')}`
+  if (JSON.stringify(before.tagViewSettings) !== JSON.stringify(after.tagViewSettings)) return 'tag-view-settings'
+  if (JSON.stringify(before.themeSettings) !== JSON.stringify(after.themeSettings)) return 'theme-settings'
+  if (JSON.stringify(before.boardDisplaySettings) !== JSON.stringify(after.boardDisplaySettings)) return 'board-display-settings'
+  return 'application-settings'
+}
 
 function setScaledDragPreview(event: React.DragEvent<HTMLElement>, source: HTMLElement): void {
   const rect = source.getBoundingClientRect()
@@ -128,12 +230,6 @@ function SearchIcon(): React.JSX.Element {
   </svg>
 }
 
-function ManageIcon(): React.JSX.Element {
-  return <svg className="manage-icon" viewBox="0 0 16 16" aria-hidden="true">
-    <path d="M2.5 4h11M2.5 8h11M2.5 12h11" />
-  </svg>
-}
-
 function MoreIcon(): React.JSX.Element {
   return <svg className="more-icon" viewBox="0 0 24 24" aria-hidden="true">
     <circle cx="5" cy="12" r="1.8" /><circle cx="12" cy="12" r="1.8" /><circle cx="19" cy="12" r="1.8" />
@@ -160,10 +256,9 @@ function AssignIcon(): React.JSX.Element {
   </svg>
 }
 
-type CardActionIconName = 'child' | 'focus' | 'delete'
+type CardActionIconName = 'focus' | 'delete'
 
 function CardActionIcon({ name }: { name: CardActionIconName }): React.JSX.Element {
-  if (name === 'child') return <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="11" height="11" rx="2" /><path d="M15 9h5v10a1 1 0 0 1-1 1H9v-5M9.5 7v5M7 9.5h5" /></svg>
   if (name === 'focus') return <svg className="tomato-icon" viewBox="0 0 24 24" aria-hidden="true">
     <path d="m7 8.2-2.4 2.3-.8 3.6.9 3.5 2.8 2.5 4.5.8 4.5-.8 2.8-2.5.9-3.5-.8-3.6L17 8.2" />
     <path d="m12 8.8-2.5 1.4.7-2.8-3.1-.8 3-1.1-1.8-2.2 3.4 1.2L12.5 2l1 2.5 3.2-1.2-1.8 2.2 3 1.1-3.1.8.7 2.8L12 8.8Z" />
@@ -174,19 +269,54 @@ function CardActionIcon({ name }: { name: CardActionIconName }): React.JSX.Eleme
 function OverflowIcon({ direction }: { direction: 'right' | 'down' }): React.JSX.Element {
   return <svg className={`bi bi-chevron-double-${direction}`} viewBox="0 0 16 16" aria-hidden="true">
     {direction === 'right'
-      ? <><path d="m3.5 2.5 5.5 5.5-5.5 5.5" /><path d="M8 2.5 13.5 8 8 13.5" /></>
-      : <><path d="M2.5 3.5 8 9l5.5-5.5" /><path d="M2.5 8 8 13.5 13.5 8" /></>}
+      ? <><path d="m1.5 3 5 5-5 5" /><path d="m9 3 5 5-5 5" /></>
+      : <><path d="m3 1.5 5 5 5-5" /><path d="m3 9 5 5 5-5" /></>}
   </svg>
+}
+
+function normalizeThemePalette(value: unknown): ThemePalette {
+  const candidate = value && typeof value === 'object' ? value as Partial<ThemePalette> : {}
+  const brightness = (raw: unknown, fallback: number): number => Math.min(100, Math.max(60, Number(raw) || fallback))
+  return {
+    color: typeof candidate.color === 'string' && /^#[0-9a-f]{6}$/i.test(candidate.color) ? candidate.color.toLowerCase() : DEFAULT_THEME_PALETTE.color,
+    projectBrightness: brightness(candidate.projectBrightness, DEFAULT_THEME_PALETTE.projectBrightness),
+    boardBrightness: brightness(candidate.boardBrightness, DEFAULT_THEME_PALETTE.boardBrightness),
+    cardBrightness: brightness(candidate.cardBrightness, DEFAULT_THEME_PALETTE.cardBrightness)
+  }
+}
+
+function normalizeThemeSettings(value: unknown): ThemeSettings {
+  const candidate = value && typeof value === 'object' ? value as Partial<ThemeSettings> : {}
+  const themes = Array.isArray(candidate.themes) ? candidate.themes.flatMap((raw) => {
+    if (!raw || typeof raw !== 'object') return []
+    const theme = raw as Partial<SavedTheme>
+    if (typeof theme.id !== 'string' || !theme.id || typeof theme.title !== 'string' || !theme.title.trim()) return []
+    return [{ id: theme.id, title: theme.title.trim().slice(0, 30), ...normalizeThemePalette(theme) }]
+  }) : []
+  const requested = typeof candidate.activeThemeId === 'string' ? candidate.activeThemeId : 'default'
+  const activeThemeId = requested === 'default' || requested === 'custom' || themes.some((theme) => theme.id === requested) ? requested : 'default'
+  return { activeThemeId, customDraft: normalizeThemePalette(candidate.customDraft), themes }
+}
+
+function hexToRgb(color: string): { r: number; g: number; b: number } {
+  const normalized = /^#[0-9a-f]{6}$/i.test(color) ? color.slice(1) : DEFAULT_THEME_PALETTE.color.slice(1)
+  return { r: Number.parseInt(normalized.slice(0, 2), 16), g: Number.parseInt(normalized.slice(2, 4), 16), b: Number.parseInt(normalized.slice(4, 6), 16) }
+}
+
+function rgbToHex(r: number, g: number, b: number): string {
+  const channel = (value: number): string => Math.min(255, Math.max(0, Math.round(value))).toString(16).padStart(2, '0')
+  return `#${channel(r)}${channel(g)}${channel(b)}`
 }
 
 function emptyState(): BoardState {
   return {
-    version: 1, focus: null, lastProjectId: null, projects: [], tags: [], boards: [],
+    version: 1, focus: null, lastProjectId: null, lastView: 'boards', projects: [], tags: [], boards: [],
     boardDisplaySettings: {}, tagViewSettings: {},
+    themeSettings: normalizeThemeSettings(null),
     displaySettings: { boardColumns: 4, boardWidth: 'medium', boardHeight: 'medium', fontSize: 'medium', dockTimerEnabled: true },
-    inboxSettings: { in_progress: true, done: false, deleted: false },
+    inboxSettings: { staged: false, in_progress: true, done: false, deleted: false },
     focusSettings: { durationMinutes: 60 },
-    shortcuts: { inbox: 'CommandOrControl+Shift+I' }
+    shortcuts: { ...DEFAULT_SHORTCUTS }
   }
 }
 
@@ -200,15 +330,21 @@ function normalizeStoredState(value: unknown): BoardState {
   if (!isBoardState(value)) return emptyState()
   const boardColumns: BoardState['displaySettings']['boardColumns'] = value.displaySettings?.boardColumns === 'auto'
     ? 'auto' : Math.min(8, Math.max(3, Number(value.displaySettings?.boardColumns) || 4))
-  const boardWidth: BoardState['displaySettings']['boardWidth'] = value.displaySettings?.boardWidth === 'narrow' || value.displaySettings?.boardWidth === 'wide'
+  const requestedBoardWidth: BoardState['displaySettings']['boardWidth'] = value.displaySettings?.boardWidth === 'auto'
+    || value.displaySettings?.boardWidth === 'narrow' || value.displaySettings?.boardWidth === 'wide'
     ? value.displaySettings.boardWidth : 'medium'
+  const boardWidth: BoardState['displaySettings']['boardWidth'] = boardColumns === 'auto' && requestedBoardWidth === 'auto'
+    ? 'medium' : requestedBoardWidth
   const boardHeight: BoardState['displaySettings']['boardHeight'] = value.displaySettings?.boardHeight === 'small'
     || value.displaySettings?.boardHeight === 'large' ? value.displaySettings.boardHeight : 'medium'
   const fontSize: BoardState['displaySettings']['fontSize'] = value.displaySettings?.fontSize === 'small' || value.displaySettings?.fontSize === 'large'
     ? value.displaySettings.fontSize : 'medium'
   const dockTimerEnabled = value.displaySettings?.dockTimerEnabled !== false
   const durationMinutes = Math.min(120, Math.max(10, Number(value.focusSettings?.durationMinutes) || 60))
-  const shortcuts = { inbox: value.shortcuts?.inbox || 'CommandOrControl+Shift+I' }
+  const shortcuts = Object.fromEntries(Object.entries(DEFAULT_SHORTCUTS).map(([key, fallback]) => [
+    key, typeof value.shortcuts?.[key as keyof ShortcutSettings] === 'string' && value.shortcuts[key as keyof ShortcutSettings]
+      ? value.shortcuts[key as keyof ShortcutSettings] : fallback
+  ])) as unknown as ShortcutSettings
   const focus = value.focus ? {
     ...value.focus,
     durationMs: Number(value.focus.durationMs) || durationMinutes * 60 * 1000
@@ -217,29 +353,47 @@ function normalizeStoredState(value: unknown): BoardState {
     ...value,
     focus,
     lastProjectId: typeof value.lastProjectId === 'string' && value.lastProjectId ? value.lastProjectId : null,
+    lastView: ['boards', 'inbox', 'flagged', 'overdue', 'tags', 'statistics', 'settings'].includes(value.lastView) ? value.lastView : 'boards',
     boardDisplaySettings: Object.fromEntries(Object.entries(value.boardDisplaySettings || {}).filter((entry): entry is [string, BoardParentDisplay] =>
       entry[1] === 'all' || entry[1] === 'in_progress' || entry[1] === 'staged' || entry[1] === 'done')),
+    themeSettings: normalizeThemeSettings(value.themeSettings),
     tagViewSettings: Object.fromEntries(Object.entries(value.tagViewSettings || {}).flatMap(([projectId, raw]) => {
       if (!raw || typeof raw !== 'object') return []
-      const config = raw as Partial<TagViewConfig>
-      if (typeof config.categoryTagId !== 'string' || !config.categoryTagId) return []
-      return [[projectId, {
-        enabled: config.enabled === true,
-        categoryTagId: config.categoryTagId,
-        statuses: {
-          staged: config.statuses?.staged === true,
-          in_progress: config.statuses?.in_progress !== false,
-          done: config.statuses?.done === true,
-          deleted: config.statuses?.deleted === true
+      const settings = raw as Partial<ProjectTagViewSettings> & Partial<TagViewConfig> & { enabled?: boolean }
+      const normalizeView = (candidate: unknown, fallbackId: string): TagViewConfig | null => {
+        if (!candidate || typeof candidate !== 'object') return null
+        const config = candidate as Partial<TagViewConfig>
+        if (typeof config.categoryTagId !== 'string' || !config.categoryTagId) return null
+        return {
+          id: typeof config.id === 'string' && config.id ? config.id : fallbackId,
+          pinned: config.pinned === true,
+          categoryTagId: config.categoryTagId,
+          statuses: {
+            staged: config.statuses?.staged === true,
+            in_progress: config.statuses?.in_progress !== false,
+            done: config.statuses?.done === true,
+            deleted: false
+          }
         }
-      }]]
+      }
+      const views = Array.isArray(settings.views)
+        ? settings.views.map((config, index) => normalizeView(config, `view-${projectId}-${index}`)).filter((config): config is TagViewConfig => Boolean(config))
+        : []
+      if (!views.length) {
+        const legacy = normalizeView(settings, `view-${projectId}-legacy`)
+        if (legacy) views.push(legacy)
+      }
+      if (!views.length) return []
+      const requestedActiveId = typeof settings.activeViewId === 'string' ? settings.activeViewId : settings.enabled === true ? views[0].id : null
+      return [[projectId, { activeViewId: views.some((config) => config.id === requestedActiveId) ? requestedActiveId : null, views }]]
     })),
     tags: Array.isArray(value.tags) ? value.tags.map((tag) => ({ ...tag, deletedAt: tag.deletedAt || null })) : [],
     displaySettings: { boardColumns, boardWidth, boardHeight, fontSize, dockTimerEnabled },
     inboxSettings: {
+      staged: value.inboxSettings?.staged === true,
       in_progress: value.inboxSettings?.in_progress !== false,
       done: value.inboxSettings?.done === true,
-      deleted: value.inboxSettings?.deleted === true
+      deleted: false
     },
     focusSettings: { durationMinutes }, shortcuts
   }
@@ -293,6 +447,15 @@ function formatDuration(milliseconds: number): string {
   return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`
 }
 
+function formatScheduleDateTime(value: string): string {
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return value
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'short',
+    hour: '2-digit', minute: '2-digit', hour12: false
+  }).format(date)
+}
+
 export function calculateFocusCredit(durationMs: number, remainingMs: number): {
   eligible: boolean; elapsedMinutes: number; minimumMinutes: number; pomodoros: number
 } {
@@ -313,6 +476,11 @@ function formatShortcut(accelerator: string): string {
   }[part] || part)).join(' ')
 }
 
+function canonicalShortcut(accelerator: string): string {
+  const replacement = navigator.platform.toLowerCase().includes('mac') ? 'Command' : 'Control'
+  return accelerator.split('+').map((part) => part === 'CommandOrControl' ? replacement : part).join('+')
+}
+
 function acceleratorFromEvent(event: React.KeyboardEvent): string | null {
   if (['Meta', 'Control', 'Shift', 'Alt'].includes(event.key)) return null
   const keyAliases: Record<string, string> = {
@@ -327,6 +495,41 @@ function acceleratorFromEvent(event: React.KeyboardEvent): string | null {
   if (event.shiftKey) modifiers.push('Shift')
   if (modifiers.length === 0 && !/^F\d{1,2}$/.test(key)) return null
   return [...modifiers, key].join('+')
+}
+
+function shortcutMatches(event: KeyboardEvent, accelerator: string, expectedKey?: string): boolean {
+  const parts = accelerator.split('+').filter(Boolean)
+  const configuredKey = expectedKey || parts.at(-1) || ''
+  const isMac = navigator.platform.toLowerCase().includes('mac')
+  const commandOrControl = parts.includes('CommandOrControl')
+  const requiresMeta = parts.includes('Command') || (commandOrControl && isMac)
+  const requiresControl = parts.includes('Control') || (commandOrControl && !isMac)
+  const requiresAlt = parts.includes('Alt')
+  const requiresShift = parts.includes('Shift')
+  if (event.metaKey !== requiresMeta || event.ctrlKey !== requiresControl
+    || event.altKey !== requiresAlt || event.shiftKey !== requiresShift) return false
+  const aliases: Record<string, string> = {
+    ' ': 'Space', ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
+    Escape: 'Esc', ',': 'Comma', '.': 'Period', '/': '/', ';': ';', "'": "'", '[': '[', ']': ']'
+  }
+  const eventKey = aliases[event.key] || (event.key.length === 1 ? event.key.toUpperCase() : event.key)
+  return eventKey === configuredKey
+}
+
+function indexedShortcutMatches(event: KeyboardEvent, accelerator: string, maximum: number): number | null {
+  if (!/^[1-9]$/.test(event.key)) return null
+  const index = Number(event.key)
+  if (index > maximum || !shortcutMatches(event, accelerator, event.key)) return null
+  return index
+}
+
+function normalizeIndexedShortcut(accelerator: string): string {
+  return [...accelerator.split('+').slice(0, -1), '1'].join('+')
+}
+
+function formatIndexedShortcut(accelerator: string, maximum: number): string {
+  const modifiers = accelerator.split('+').slice(0, -1)
+  return `${formatShortcut([...modifiers, '1'].join('+'))}…${maximum}`
 }
 
 function resizeInlineTextarea(element: HTMLTextAreaElement): void {
@@ -377,20 +580,22 @@ function createDockIconDataUrl(label = ''): string {
   if (paused) {
     context.save()
     context.globalAlpha = 1
-    context.fillStyle = 'rgba(17, 91, 82, .48)'
+    context.fillStyle = 'rgba(17, 91, 82, .28)'
     context.beginPath()
-    context.arc(256, 256, 74, 0, Math.PI * 2)
+    context.arc(256, 256, 112, 0, Math.PI * 2)
     context.fill()
-    context.strokeStyle = 'rgba(255, 255, 255, .68)'
-    context.lineWidth = 5
+    context.strokeStyle = 'rgba(255, 255, 255, .94)'
+    context.lineWidth = 11
     context.stroke()
-    context.fillStyle = 'rgba(255, 255, 255, .96)'
+    context.strokeStyle = 'rgba(255, 255, 255, .97)'
+    context.lineWidth = 11
+    context.lineJoin = 'round'
     context.beginPath()
-    context.moveTo(238, 214)
-    context.lineTo(238, 298)
-    context.lineTo(306, 256)
+    context.moveTo(228, 190)
+    context.lineTo(228, 322)
+    context.lineTo(334, 256)
     context.closePath()
-    context.fill()
+    context.stroke()
     context.restore()
   }
   return canvas.toDataURL('image/png')
@@ -531,7 +736,16 @@ export function expandRepeatCards(state: BoardState, at = new Date()): BoardStat
 
 function App(): React.JSX.Element {
   const [state, setState] = useState<BoardState | null>(null)
-  const [view, setView] = useState<'boards' | 'inbox' | 'flagged' | 'overdue' | 'tags' | 'statistics' | 'settings'>('boards')
+  const undoStackRef = useRef<ReversibleOperation[]>([])
+  const redoStackRef = useRef<ReversibleOperation[]>([])
+  const previousHistoryStateRef = useRef<BoardState | null>(null)
+  const historyModeRef = useRef<'undo' | 'redo' | 'ignore' | null>(null)
+  const historyNoticeTimerRef = useRef<number | null>(null)
+  const [historyNotice, setHistoryNotice] = useState<string | null>(null)
+  const [hoverTooltip, setHoverTooltip] = useState<{ text: string; left: number; top: number; above: boolean } | null>(null)
+  const hoverTooltipTargetRef = useRef<HTMLElement | null>(null)
+  const hoverTooltipTimerRef = useRef<number | null>(null)
+  const [view, setView] = useState<AppView>('boards')
   const [includeCompleted, setIncludeCompleted] = useState(false)
   const [editingCard, setEditingCard] = useState<BoardCard | null>(null)
   const [editingCardAnchor, setEditingCardAnchor] = useState<DOMRect | null>(null)
@@ -539,16 +753,22 @@ function App(): React.JSX.Element {
   const [searchOpen, setSearchOpen] = useState(false)
   const [locatedSearchResult, setLocatedSearchResult] = useState<{ type: SearchResultType; id: string } | null>(null)
   const [projectManagerOpen, setProjectManagerOpen] = useState(false)
+  const [themeEditor, setThemeEditor] = useState<{ themeId: string | null; previousActiveThemeId: string; previousDraft: ThemePalette } | null>(null)
   const [requestedProjectRenameId, setRequestedProjectRenameId] = useState<string | null>(null)
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null)
   const [isNewCard, setIsNewCard] = useState(false)
   const [filterBoardId, setFilterBoardId] = useState<string | null>(null)
   const [selectedTagId, setSelectedTagId] = useState<string | null>(null)
+  const [tagProjectIds, setTagProjectIds] = useState<Set<string>>(new Set())
+  const [importantProjectIds, setImportantProjectIds] = useState<Set<string>>(new Set())
+  const [overdueProjectIds, setOverdueProjectIds] = useState<Set<string>>(new Set())
+  const [tagCardStatus, setTagCardStatus] = useState<BoardParentDisplay>('all')
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const [childDisplaySelections, setChildDisplaySelections] = useState<Record<string, ChildDisplay>>({})
   const [boardDisplaySelections, setBoardDisplaySelections] = useState<Record<string, BoardParentDisplay>>({})
   const [importantChildDisplay, setImportantChildDisplay] = useState<'first' | 'all'>('first')
   const [overdueChildDisplay, setOverdueChildDisplay] = useState<'first' | 'all'>('first')
+  const [scheduleTab, setScheduleTab] = useState<'calendar' | 'schedule' | 'overdue'>('overdue')
   const [overdueFlaggedOnly, setOverdueFlaggedOnly] = useState(false)
   const [dragCardId, setDragCardId] = useState<string | null>(null)
   const [dragCardTargetId, setDragCardTargetId] = useState<string | null>(null)
@@ -558,6 +778,7 @@ function App(): React.JSX.Element {
   const dragBoardIdRef = useRef<string | null>(null)
   const dragBoardTargetIdRef = useRef<string | null>(null)
   const [inlineEditingCardId, setInlineEditingCardId] = useState<string | null>(null)
+  const [inlineEditingBoardId, setInlineEditingBoardId] = useState<string | null>(null)
   const [now, setNow] = useState(Date.now())
   const [storageSwitching, setStorageSwitching] = useState(false)
   const [hasMoreBoardsRight, setHasMoreBoardsRight] = useState(false)
@@ -565,16 +786,149 @@ function App(): React.JSX.Element {
   const boardsViewportRef = useRef<HTMLDivElement | null>(null)
   const saveTimerRef = useRef<number | null>(null)
 
+  const showHistoryNotice = useCallback((message: string): void => {
+    if (historyNoticeTimerRef.current !== null) window.clearTimeout(historyNoticeTimerRef.current)
+    setHistoryNotice(message)
+    historyNoticeTimerRef.current = window.setTimeout(() => {
+      historyNoticeTimerRef.current = null
+      setHistoryNotice(null)
+    }, 2200)
+  }, [])
+
+  const clearOperationHistory = useCallback((): void => {
+    undoStackRef.current = []
+    redoStackRef.current = []
+  }, [])
+
+  const undoLastOperation = useCallback((): void => {
+    const operation = undoStackRef.current.pop()
+    if (!operation) {
+      showHistoryNotice('没有可撤回的操作')
+      return
+    }
+    redoStackRef.current.push(operation)
+    historyModeRef.current = 'undo'
+    setState((current) => current ? applyUndoSnapshot(current, operation.inverse) : current)
+    setBoardDisplaySelections(operation.inverse.boardDisplaySettings)
+    showHistoryNotice(`已撤回：${operation.description}`)
+  }, [showHistoryNotice])
+
+  const redoLastOperation = useCallback((): void => {
+    const operation = redoStackRef.current.pop()
+    if (!operation) {
+      showHistoryNotice('没有可重做的操作')
+      return
+    }
+    undoStackRef.current.push(operation)
+    historyModeRef.current = 'redo'
+    setState((current) => current ? applyUndoSnapshot(current, operation.forward) : current)
+    setBoardDisplaySelections(operation.forward.boardDisplaySettings)
+    showHistoryNotice(`已重做：${operation.description}`)
+  }, [showHistoryNotice])
+
+  useEffect(() => () => {
+    if (historyNoticeTimerRef.current !== null) window.clearTimeout(historyNoticeTimerRef.current)
+  }, [])
+
+  useEffect(() => {
+    const previous = previousHistoryStateRef.current
+    previousHistoryStateRef.current = state
+    if (!previous || !state) return
+    if (historyModeRef.current) {
+      historyModeRef.current = null
+      return
+    }
+    const inverse = takeUndoSnapshot(previous)
+    const forward = takeUndoSnapshot(state)
+    if (sameUndoSnapshot(inverse, forward)) return
+    const description = describeOperation(inverse, forward)
+    const mergeKey = operationMergeKey(inverse, forward)
+    const now = Date.now()
+    const last = undoStackRef.current.at(-1)
+    if (last && last.mergeKey === mergeKey && now - last.createdAt < 700) {
+      last.forward = forward
+      last.createdAt = now
+    } else {
+      undoStackRef.current.push({ id: uid(), description, mergeKey, forward, inverse, createdAt: now })
+      if (undoStackRef.current.length > 50) undoStackRef.current.shift()
+    }
+    redoStackRef.current = []
+  }, [state])
+
+  useEffect(() => {
+    const clearTooltip = (): void => {
+      if (hoverTooltipTimerRef.current !== null) {
+        window.clearTimeout(hoverTooltipTimerRef.current)
+        hoverTooltipTimerRef.current = null
+      }
+      const target = hoverTooltipTargetRef.current
+      if (target) {
+        const title = target.dataset.hoverTooltipTitle
+        if (title && !target.hasAttribute('title')) target.setAttribute('title', title)
+        delete target.dataset.hoverTooltipTitle
+      }
+      hoverTooltipTargetRef.current = null
+      setHoverTooltip(null)
+    }
+    const beginTooltip = (event: PointerEvent): void => {
+      const target = event.target instanceof Element ? event.target.closest<HTMLElement>('[title]') : null
+      if (!target || target === hoverTooltipTargetRef.current) return
+      clearTooltip()
+      const text = target.getAttribute('title')?.trim()
+      if (!text) return
+      target.dataset.hoverTooltipTitle = text
+      target.removeAttribute('title')
+      hoverTooltipTargetRef.current = target
+      hoverTooltipTimerRef.current = window.setTimeout(() => {
+        if (hoverTooltipTargetRef.current !== target || !target.isConnected || !target.matches(':hover')) return
+        const rect = target.getBoundingClientRect()
+        const estimatedWidth = Math.min(280, Math.max(54, text.length * 12 + 16))
+        const left = Math.max(estimatedWidth / 2 + 8, Math.min(window.innerWidth - estimatedWidth / 2 - 8, rect.left + rect.width / 2))
+        const above = rect.bottom + 38 > window.innerHeight
+        setHoverTooltip({ text, left, top: above ? rect.top - 7 : rect.bottom + 7, above })
+        hoverTooltipTimerRef.current = null
+      }, 2000)
+    }
+    const endTooltip = (event: PointerEvent): void => {
+      const target = hoverTooltipTargetRef.current
+      if (!target || (event.relatedTarget instanceof Node && target.contains(event.relatedTarget))) return
+      clearTooltip()
+    }
+    document.addEventListener('pointerover', beginTooltip, true)
+    document.addEventListener('pointerout', endTooltip, true)
+    document.addEventListener('pointerdown', clearTooltip, true)
+    document.addEventListener('scroll', clearTooltip, true)
+    window.addEventListener('resize', clearTooltip)
+    return () => {
+      document.removeEventListener('pointerover', beginTooltip, true)
+      document.removeEventListener('pointerout', endTooltip, true)
+      document.removeEventListener('pointerdown', clearTooltip, true)
+      document.removeEventListener('scroll', clearTooltip, true)
+      window.removeEventListener('resize', clearTooltip)
+      clearTooltip()
+    }
+  }, [])
+
   useEffect(() => {
     void window.api.loadBoards().then((stored) => {
       const normalized = expandRepeatCards(normalizeStoredState(stored))
       setState(normalized)
+      setView(normalized.lastView)
       setBoardDisplaySelections(normalized.boardDisplaySettings)
       const restoredProjectId = normalized.lastProjectId && normalized.projects.some((project) => project.id === normalized.lastProjectId && !project.deletedAt && !project.archivedAt)
         ? normalized.lastProjectId : normalized.lastProjectId ? normalized.projects.find((project) => !project.deletedAt && !project.archivedAt)?.id || null : null
       setActiveProjectId(restoredProjectId)
     })
   }, [])
+
+  useEffect(() => {
+    setState((current) => {
+      if (!current || current.lastView === view) return current
+      const next = { ...current, lastView: view }
+      void window.api.saveBoards(next).catch((error) => console.error('保存上次页面失败', error))
+      return next
+    })
+  }, [view])
 
   useEffect(() => {
     const fontSize = state?.displaySettings.fontSize || 'medium'
@@ -624,7 +978,12 @@ function App(): React.JSX.Element {
   useEffect(() => {
     const expandDueRepeats = (): void => {
       setNow(Date.now())
-      setState((current) => current ? expandRepeatCards(current, new Date()) : current)
+      setState((current) => {
+        if (!current) return current
+        const next = expandRepeatCards(current, new Date())
+        if (next !== current) historyModeRef.current = 'ignore'
+        return next
+      })
     }
     const timer = window.setInterval(expandDueRepeats, 30_000)
     window.addEventListener('focus', expandDueRepeats)
@@ -642,6 +1001,7 @@ function App(): React.JSX.Element {
 
   useEffect(() => {
     if (!state?.focus?.running || now < state.focus.endsAt) return
+    historyModeRef.current = 'ignore'
     setState((current) => {
       if (!current?.focus || current.focus.endsAt > Date.now()) return current
       const cardId = current.focus.cardId
@@ -667,6 +1027,15 @@ function App(): React.JSX.Element {
   useEffect(() => {
     const dockState = state?.focus ? state.focus.running ? 'running' : 'paused' : 'none'
     void window.api.setDockFocusState(dockState)
+  }, [state?.focus])
+
+  useEffect(() => {
+    const focus = state?.focus
+      ? { running: state.focus.running, endsAt: state.focus.endsAt, remainingMs: state.focus.remainingMs }
+      : null
+    void window.api.setStatusBarFocus(focus).then((visible) => {
+      if (focus && !visible) console.warn('Status bar timer was not created')
+    }).catch((error) => console.error('更新状态栏番茄钟失败', error))
   }, [state?.focus])
 
   useEffect(() => window.api.onDockFocusAction((action) => {
@@ -699,9 +1068,16 @@ function App(): React.JSX.Element {
     visit(selectedTagId)
     return ids
   }, [activeTags, selectedTagId, state])
-  const taggedCards = useMemo(() => selectedTagIds.size
-    ? allCards.filter((card) => card.status !== 'deleted' && card.tagIds.some((tagId) => selectedTagIds.has(tagId)))
-    : [], [allCards, selectedTagIds])
+  const taggedCards = useMemo(() => {
+    if (!selectedTagIds.size) return []
+    const projectBoardIds = tagProjectIds.size && state
+      ? new Set(state.boards.filter((board) => board.id !== INBOX_BOARD_ID && board.status === 'active' && tagProjectIds.has(board.projectId)).map((board) => board.id))
+      : null
+    return allCards.filter((card) => card.status !== 'deleted'
+      && (!projectBoardIds || projectBoardIds.has(card.boardId))
+      && (tagCardStatus === 'all' || card.status === tagCardStatus)
+      && card.tagIds.some((tagId) => selectedTagIds.has(tagId)))
+  }, [allCards, selectedTagIds, state, tagCardStatus, tagProjectIds])
   const tagBoard = useMemo<Board>(() => ({
     id: '__vistask_tags__', projectId: '', status: 'active', statusChangedAt: null, title: 'Tag', color: '#25ae9f', sort: 0, height: null,
     filter: { staged: true, in_progress: true, done: true, deleted: false }, cards: taggedCards
@@ -711,7 +1087,23 @@ function App(): React.JSX.Element {
     if (!activeTags.length) { if (selectedTagId) setSelectedTagId(null); return }
     if (!selectedTagId || !activeTags.some((tag) => tag.id === selectedTagId)) setSelectedTagId(activeTags[0].id)
   }, [activeTags, selectedTagId])
-  const flaggedCards = useMemo(() => allCards.filter((card) => card.flagged && card.status !== 'deleted' && (includeCompleted || card.status !== 'done')), [allCards, includeCompleted])
+  useEffect(() => {
+    const activeIds = new Set(activeProjects.map((project) => project.id))
+    const retainActive = (current: Set<string>): Set<string> => {
+      const next = new Set([...current].filter((projectId) => activeIds.has(projectId)))
+      return next.size === current.size ? current : next
+    }
+    setTagProjectIds(retainActive)
+    setImportantProjectIds(retainActive)
+    setOverdueProjectIds(retainActive)
+  }, [activeProjects])
+  const flaggedCards = useMemo(() => {
+    const boardIds = importantProjectIds.size && state
+      ? new Set(state.boards.filter((board) => board.status === 'active' && importantProjectIds.has(board.projectId)).map((board) => board.id))
+      : null
+    return allCards.filter((card) => (!boardIds || boardIds.has(card.boardId))
+      && card.flagged && card.status !== 'deleted' && (includeCompleted || card.status !== 'done'))
+  }, [allCards, importantProjectIds, includeCompleted, state])
   const displayedFlaggedCards = useMemo(() => {
     const parents = new Map(allCards.filter((card) => !card.parentId).map((card) => [card.id, card]))
     const candidateIds = new Set<string>()
@@ -753,11 +1145,17 @@ function App(): React.JSX.Element {
     id: '__cardex_important__', projectId: '', status: 'active', statusChangedAt: null, title: '重要', color: '#e6a02d', sort: 0, height: null,
     filter: { staged: true, in_progress: true, done: includeCompleted, deleted: false }, cards: displayedFlaggedCards
   }), [displayedFlaggedCards, includeCompleted])
-  const overdueCards = useMemo(() => allCards.filter((card) => {
+  const overdueCards = useMemo(() => {
+    const boardIds = overdueProjectIds.size && state
+      ? new Set(state.boards.filter((board) => board.status === 'active' && overdueProjectIds.has(board.projectId)).map((board) => board.id))
+      : null
+    return allCards.filter((card) => {
+    if (boardIds && !boardIds.has(card.boardId)) return false
     if (card.status !== 'in_progress' || !card.dueAt) return false
     const dueTimestamp = new Date(card.dueAt).getTime()
     return Number.isFinite(dueTimestamp) && dueTimestamp < now
-  }), [allCards, now])
+    })
+  }, [allCards, now, overdueProjectIds, state])
   const filteredOverdueCards = useMemo(() => overdueFlaggedOnly
     ? overdueCards.filter((card) => card.flagged)
     : overdueCards, [overdueCards, overdueFlaggedOnly])
@@ -790,6 +1188,13 @@ function App(): React.JSX.Element {
       cards: displayedOverdueCards
     }
   }, [displayedOverdueCards])
+  const scheduledCards = useMemo(() => allCards
+    .filter((card) => card.status !== 'deleted' && card.dueAt && Number.isFinite(new Date(card.dueAt).getTime()))
+    .sort((left, right) => {
+      const dueDifference = new Date(right.dueAt as string).getTime() - new Date(left.dueAt as string).getTime()
+      return dueDifference || new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()
+    }), [allCards])
+  const boardsById = useMemo(() => new Map(state?.boards.map((board) => [board.id, board]) || []), [state])
   const statistics = useMemo(() => {
     const currentCards = allCards.filter((card) => card.status === 'in_progress')
     const currentOverdue = currentCards.filter((card) => card.dueAt && new Date(card.dueAt).getTime() < now)
@@ -820,10 +1225,10 @@ function App(): React.JSX.Element {
   const displayedInboxBoard = useMemo<Board | null>(() => inboxBoard && state ? {
     ...inboxBoard,
     filter: {
-      staged: state.inboxSettings.in_progress,
+      staged: state.inboxSettings.staged,
       in_progress: state.inboxSettings.in_progress,
       done: state.inboxSettings.done,
-      deleted: state.inboxSettings.deleted
+      deleted: false
     }
   } : null, [inboxBoard, state])
   const inboxVisibleCount = displayedInboxBoard?.cards.filter((card) => displayedInboxBoard.filter[card.status] !== false).length ?? 0
@@ -834,10 +1239,13 @@ function App(): React.JSX.Element {
       .sort((left, right) => left.sort - right.sort)
     return activeProjectId ? boards.filter((board) => board.projectId === activeProjectId) : boards
   }, [activeProjectId, activeProjectIds, state])
-  const activeTagViewConfig = activeProjectId ? state?.tagViewSettings[activeProjectId] : undefined
+  const activeProjectTagViews = activeProjectId ? state?.tagViewSettings[activeProjectId] : undefined
+  const activeTagViewConfig = activeProjectTagViews?.views.find((config) => config.id === activeProjectTagViews.activeViewId)
   const visibleBoards = useMemo(() => {
-    if (!state || !activeProjectId || !activeTagViewConfig?.enabled) return regularVisibleBoards
+    if (!state || !activeProjectId || !activeTagViewConfig) return regularVisibleBoards
+    const category = activeTags.find((tag) => tag.id === activeTagViewConfig.categoryTagId)
     const categoryValues = activeTags.filter((tag) => tag.parentId === activeTagViewConfig.categoryTagId)
+      .sort((left, right) => left.sort - right.sort || left.createdAt.localeCompare(right.createdAt))
     if (!categoryValues.length) return regularVisibleBoards
     const projectCards = state.boards
       .filter((board) => board.id !== INBOX_BOARD_ID && board.status === 'active' && board.projectId === activeProjectId)
@@ -855,49 +1263,85 @@ function App(): React.JSX.Element {
     }
     const valueTagIds = categoryValues.map((tag) => ({ tag, ids: descendantIds(tag.id) }))
     const matchedCardIds = new Set<string>()
-    const boards = valueTagIds.map(({ tag, ids }, index): Board => {
+    const valueBoards = valueTagIds.map(({ tag, ids }, index): Board => {
       const cards = projectCards.filter((card) => card.tagIds.some((tagId) => ids.has(tagId)))
       cards.forEach((card) => matchedCardIds.add(card.id))
       return {
         id: `__tag_view__:${activeProjectId}:${tag.id}`,
         projectId: activeProjectId,
-        status: 'active', statusChangedAt: null, title: tag.title, color: COLORS[index % COLORS.length], sort: index, height: null,
+        status: 'active', statusChangedAt: null, title: tag.title, color: COLORS[index % COLORS.length], sort: index + 1, height: null,
         filter: { ...activeTagViewConfig.statuses }, cards
       }
     })
-    boards.push({
+    const unassignedBoard: Board = {
       id: `__tag_view__:${activeProjectId}:unassigned`,
       projectId: activeProjectId,
-      status: 'active', statusChangedAt: null, title: '无该类别标签', color: '#a5aaa8', sort: boards.length, height: null,
+      status: 'active', statusChangedAt: null, title: `无${category?.title || '该类别'}标签`, color: '#a5aaa8', sort: 0, height: null,
       filter: { ...activeTagViewConfig.statuses }, cards: projectCards.filter((card) => !matchedCardIds.has(card.id))
-    })
-    return boards
+    }
+    return [unassignedBoard, ...valueBoards]
   }, [activeProjectId, activeTagViewConfig, activeTags, regularVisibleBoards, state])
-  const isTagViewActive = Boolean(activeProjectId && activeTagViewConfig?.enabled
+  const isTagViewActive = Boolean(activeProjectId && activeTagViewConfig
     && activeTags.some((tag) => tag.parentId === activeTagViewConfig.categoryTagId))
+  const visibleBoardLayoutKey = visibleBoards.map((board) => board.id).join('|')
   const selectedProject = activeProjectId ? activeProjects.find((project) => project.id === activeProjectId) || null : null
   const visibleProjectCardCount = new Set(visibleBoards.flatMap((board) => board.cards.map((card) => card.id))).size
+  const shortcuts = state?.shortcuts || DEFAULT_SHORTCUTS
 
   useEffect(() => {
     const handleAppShortcut = (event: KeyboardEvent): void => {
-      if (event.metaKey && event.shiftKey && !event.ctrlKey && !event.altKey && event.key.toLowerCase() === 'f') {
+      const target = event.target
+      const editingText = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
+        || (target instanceof HTMLElement && target.isContentEditable)
+      if (!editingText && shortcutMatches(event, shortcuts.undo)) {
+        event.preventDefault()
+        undoLastOperation()
+        return
+      }
+      if (!editingText && shortcutMatches(event, shortcuts.redo)) {
+        event.preventDefault()
+        redoLastOperation()
+        return
+      }
+      if (!editingText && shortcutMatches(event, shortcuts.search)) {
         event.preventDefault()
         setSearchOpen(true)
         return
       }
-      if (event.metaKey && event.shiftKey && !event.ctrlKey && !event.altKey && event.key.toLowerCase() === 'p') {
+      if (!editingText && shortcutMatches(event, shortcuts.boards)) {
         event.preventDefault()
         setView('boards')
         return
       }
-      if (event.metaKey && event.shiftKey && !event.ctrlKey && !event.altKey && event.key.toLowerCase() === 't') {
+      if (!editingText && shortcutMatches(event, shortcuts.tags)) {
         event.preventDefault()
         setView('tags')
         return
       }
-      if (!event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return
-      if (view !== 'boards' || !/^[1-9]$/.test(event.key)) return
-      const project = activeProjects[Number(event.key) - 1]
+      if (!editingText && shortcutMatches(event, shortcuts.settings)) {
+        event.preventDefault()
+        setView('settings')
+        return
+      }
+      if (!editingText && shortcutMatches(event, shortcuts.plan)) {
+        event.preventDefault()
+        setView('overdue')
+        return
+      }
+      if (editingText) return
+      if (view === 'overdue') {
+        const index = indexedShortcutMatches(event, shortcuts.planTabs, 3)
+        if (!index) return
+        const tab = (['calendar', 'schedule', 'overdue'] as const)[index - 1]
+        if (!tab) return
+        event.preventDefault()
+        setScheduleTab(tab)
+        return
+      }
+      if (view !== 'boards') return
+      const index = indexedShortcutMatches(event, shortcuts.projectTabs, 9)
+      if (!index) return
+      const project = activeProjects[index - 1]
       if (!project) return
       event.preventDefault()
       setActiveProjectId(project.id)
@@ -910,7 +1354,7 @@ function App(): React.JSX.Element {
     }
     window.addEventListener('keydown', handleAppShortcut)
     return () => window.removeEventListener('keydown', handleAppShortcut)
-  }, [activeProjects, view])
+  }, [activeProjects, redoLastOperation, shortcuts, undoLastOperation, view])
 
   useEffect(() => {
     if (!locatedSearchResult) return
@@ -942,8 +1386,11 @@ function App(): React.JSX.Element {
     if (!viewport || !row) return
     viewport.scrollTo({ left: 0, top: 0 })
     const updateOverflow = (): void => {
-      setHasMoreBoardsRight(viewport.scrollWidth - viewport.scrollLeft - viewport.clientWidth > 2)
-      setHasMoreBoardsBelow(viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight > 2)
+      const viewportRect = viewport.getBoundingClientRect()
+      const contentItems = Array.from(row.children).filter((element): element is HTMLElement =>
+        element instanceof HTMLElement && (element.classList.contains('board-column') || element.classList.contains('add-board')))
+      setHasMoreBoardsRight(contentItems.some((element) => element.getBoundingClientRect().right > viewportRect.right + 2))
+      setHasMoreBoardsBelow(contentItems.some((element) => element.getBoundingClientRect().bottom > viewportRect.bottom + 2))
     }
     const frame = window.requestAnimationFrame(updateOverflow)
     const observer = new ResizeObserver(updateOverflow)
@@ -956,7 +1403,7 @@ function App(): React.JSX.Element {
       observer.disconnect()
       viewport.removeEventListener('scroll', updateOverflow)
     }
-  }, [activeProjectId, state?.displaySettings.boardColumns, state?.displaySettings.boardWidth, view, visibleBoards.length])
+  }, [activeProjectId, state?.displaySettings.boardColumns, state?.displaySettings.boardWidth, view, visibleBoardLayoutKey])
 
   function updateBoard(boardId: string, updater: (board: Board) => Board): void {
     setState((current) => current ? { ...current, boards: current.boards.map((board) => board.id === boardId ? updater(board) : board) } : current)
@@ -982,6 +1429,8 @@ function App(): React.JSX.Element {
       window.clearTimeout(saveTimerRef.current)
       saveTimerRef.current = null
     }
+    clearOperationHistory()
+    historyModeRef.current = 'ignore'
     setState(nextState)
     void window.api.saveBoards(nextState).catch((error) => console.error('保存看板高度设置失败', error))
   }
@@ -1085,7 +1534,17 @@ function App(): React.JSX.Element {
       setProjectManagerOpen(true)
       return
     }
-    setEditingBoard({ id: null, title: '' })
+    if (!state) return
+    const projectId = activeProjectId || activeProjects[0]?.id
+    if (!projectId) return
+    const projectBoards = state.boards.filter((board) => board.id !== INBOX_BOARD_ID && board.projectId === projectId)
+    const board: Board = {
+      id: uid(), projectId, title: '未命名看板', color: COLORS[projectBoards.length % COLORS.length],
+      sort: projectBoards.reduce((maximum, item) => Math.max(maximum, item.sort), -1) + 1,
+      status: 'active', statusChangedAt: null, height: null, filter: { ...DEFAULT_FILTER }, cards: []
+    }
+    setState({ ...state, boards: [...state.boards, board] })
+    setInlineEditingBoardId(board.id)
   }
 
   function addInboxCard(): void {
@@ -1307,8 +1766,8 @@ function App(): React.JSX.Element {
     setChildDisplaySelections((current) => ({ ...current, [cardId]: display }))
   }
 
-  function addTag(parentId: string | null, titleValue: string): void {
-    if (!state) return
+  function addTag(parentId: string | null, titleValue: string): string | null {
+    if (!state) return null
     let depth = 1
     let parent = parentId ? state.tags.find((tag) => tag.id === parentId) : undefined
     while (parent?.parentId) {
@@ -1317,10 +1776,10 @@ function App(): React.JSX.Element {
     }
     if (parentId && depth >= 3) {
       window.alert('Tag 最多支持三级，不能继续新增子 Tag。')
-      return
+      return null
     }
     const title = titleValue.trim()
-    if (!title) return
+    if (!title) return null
     const timestamp = new Date().toISOString()
     const tag: CardTag = {
       id: uid(), title, parentId,
@@ -1329,6 +1788,17 @@ function App(): React.JSX.Element {
     }
     setState((current) => current ? { ...current, tags: [...current.tags, tag] } : current)
     setSelectedTagId(tag.id)
+    return tag.id
+  }
+
+  function renameTag(tagId: string, titleValue: string): void {
+    const title = titleValue.trim()
+    if (!title) return
+    const updatedAt = new Date().toISOString()
+    setState((current) => current ? {
+      ...current,
+      tags: current.tags.map((tag) => tag.id === tagId ? { ...tag, title, updatedAt } : tag)
+    } : current)
   }
 
   function deleteTag(tagId: string): void {
@@ -1395,6 +1865,34 @@ function App(): React.JSX.Element {
     }) })
   }
 
+  function moveCardInTagView(cardId: string, targetBoardId: string): void {
+    if (!activeProjectId || !activeTagViewConfig || !targetBoardId.startsWith(`__tag_view__:${activeProjectId}:`)) return
+    const unassigned = targetBoardId.endsWith(':unassigned')
+    const targetTagId = unassigned ? null : targetBoardId.slice(targetBoardId.lastIndexOf(':') + 1)
+    const targetIsValid = targetTagId === null || activeTags.some((tag) => tag.id === targetTagId && tag.parentId === activeTagViewConfig.categoryTagId)
+    if (!targetIsValid) return
+    const categoryTagIds = new Set<string>()
+    const visit = (tagId: string): void => {
+      if (categoryTagIds.has(tagId)) return
+      categoryTagIds.add(tagId)
+      activeTags.filter((tag) => tag.parentId === tagId).forEach((tag) => visit(tag.id))
+    }
+    visit(activeTagViewConfig.categoryTagId)
+    const updatedAt = new Date().toISOString()
+    setState((current) => current ? {
+      ...current,
+      boards: current.boards.map((board) => ({
+        ...board,
+        cards: board.cards.map((card) => {
+          if (card.id !== cardId) return card
+          const tagIds = card.tagIds.filter((tagId) => !categoryTagIds.has(tagId))
+          if (targetTagId) tagIds.push(targetTagId)
+          return { ...card, tagIds, updatedAt }
+        })
+      }))
+    } : current)
+  }
+
   function startCardDrag(cardId: string | null): void {
     setDragCardId(cardId)
     if (cardId) {
@@ -1446,6 +1944,7 @@ function App(): React.JSX.Element {
     const confirmed = window.confirm(`本次推进 ${credit.elapsedMinutes.toFixed(1)} 分钟，折合 ${credit.pomodoros.toFixed(1)} 个番茄。确认结束并计入统计吗？`)
     if (!confirmed) return
     const creditedMinutes = Number(credit.elapsedMinutes.toFixed(1))
+    historyModeRef.current = 'ignore'
     setState((current) => current ? {
       ...current,
       focus: null,
@@ -1466,7 +1965,10 @@ function App(): React.JSX.Element {
           : await window.api.useDefaultDatabase()
       if (!result) return null
       const normalized = expandRepeatCards(normalizeStoredState(result.state))
+      clearOperationHistory()
+      historyModeRef.current = 'ignore'
       setState(normalized)
+      setView(normalized.lastView)
       setBoardDisplaySelections(normalized.boardDisplaySettings)
       const restoredProjectId = normalized.lastProjectId && normalized.projects.some((project) => project.id === normalized.lastProjectId && !project.deletedAt && !project.archivedAt)
         ? normalized.lastProjectId : normalized.lastProjectId ? normalized.projects.find((project) => !project.deletedAt && !project.archivedAt)?.id || null : null
@@ -1505,12 +2007,99 @@ function App(): React.JSX.Element {
   }
 
   if (!state) return <div className="loading-screen">正在打开 Vistask…</div>
+  const currentState = state
+  const activeSavedTheme = currentState.themeSettings.themes.find((theme) => theme.id === currentState.themeSettings.activeThemeId)
+  const surfacePalette = currentState.themeSettings.activeThemeId === 'custom'
+    ? currentState.themeSettings.customDraft : activeSavedTheme || DEFAULT_THEME_PALETTE
+
+  function openThemeEditor(themeId: string | null): void {
+    const selectedTheme = themeId ? currentState.themeSettings.themes.find((theme) => theme.id === themeId) : null
+    const currentPalette = currentState.themeSettings.activeThemeId === 'custom'
+      ? currentState.themeSettings.customDraft
+      : activeSavedTheme || DEFAULT_THEME_PALETTE
+    const draft = normalizeThemePalette(selectedTheme || currentPalette)
+    setThemeEditor({
+      themeId,
+      previousActiveThemeId: currentState.themeSettings.activeThemeId,
+      previousDraft: { ...currentState.themeSettings.customDraft }
+    })
+    setState((current) => current ? {
+      ...current,
+      themeSettings: { ...current.themeSettings, activeThemeId: 'custom', customDraft: draft }
+    } : current)
+    setView('boards')
+  }
+
+  function updateThemeEditorPalette(palette: ThemePalette): void {
+    setState((current) => current ? {
+      ...current,
+      themeSettings: { ...current.themeSettings, activeThemeId: 'custom', customDraft: normalizeThemePalette(palette) }
+    } : current)
+  }
+
+  function cancelThemeEditor(): void {
+    if (!themeEditor) return
+    const previous = themeEditor
+    setState((current) => current ? {
+      ...current,
+      themeSettings: { ...current.themeSettings, activeThemeId: previous.previousActiveThemeId, customDraft: previous.previousDraft }
+    } : current)
+    setThemeEditor(null)
+  }
+
+  function saveThemeEditor(titleValue: string): void {
+    if (!themeEditor) return
+    const title = titleValue.trim().slice(0, 30)
+    if (!title) return
+    const editingId = themeEditor.themeId
+    setState((current) => {
+      if (!current) return current
+      const theme: SavedTheme = { id: editingId || uid(), title, ...current.themeSettings.customDraft }
+      const themes = editingId
+        ? current.themeSettings.themes.map((item) => item.id === editingId ? theme : item)
+        : [...current.themeSettings.themes, theme]
+      return { ...current, themeSettings: { ...current.themeSettings, activeThemeId: theme.id, themes } }
+    })
+    setThemeEditor(null)
+  }
+
+  function deleteTheme(themeId: string): void {
+    const theme = currentState.themeSettings.themes.find((item) => item.id === themeId)
+    if (!theme || !window.confirm(`删除主题“${theme.title}”？此操作不会影响项目数据。`)) return
+    setState((current) => current ? {
+      ...current,
+      themeSettings: {
+        ...current.themeSettings,
+        activeThemeId: current.themeSettings.activeThemeId === themeId ? 'default' : current.themeSettings.activeThemeId,
+        themes: current.themeSettings.themes.filter((item) => item.id !== themeId)
+      }
+    } : current)
+  }
+  const surfaceBrightness = {
+    project: surfacePalette.projectBrightness,
+    board: surfacePalette.boardBrightness,
+    card: surfacePalette.cardBrightness
+  }
+  const surfaceThemeColor = surfacePalette.color
   const focusCard = state.focus ? allCards.find((card) => card.id === state.focus?.cardId) : null
   const focusRemaining = state.focus ? (state.focus.running ? state.focus.endsAt - now : state.focus.remainingMs) : 0
-  const boardWidthPixels = ({ narrow: 220, medium: 276, wide: 340 } as const)[state.displaySettings.boardWidth]
-  const boardRowWidth = state.displaySettings.boardColumns === 'auto' ? '100%'
-    : `${state.displaySettings.boardColumns * boardWidthPixels + (state.displaySettings.boardColumns - 1) * 10}px`
-  return <div className={`app-shell font-${state.displaySettings.fontSize}`}>
+  const fixedBoardWidthPixels = state.displaySettings.boardWidth === 'auto'
+    ? null : ({ narrow: 220, medium: 276, wide: 340 } as const)[state.displaySettings.boardWidth]
+  const fixedBoardColumns = state.displaySettings.boardColumns === 'auto' ? null : state.displaySettings.boardColumns
+  const boardWidthValue = state.displaySettings.boardWidth === 'auto' && fixedBoardColumns
+    ? `calc((100% - ${(fixedBoardColumns - 1) * 10}px) / ${fixedBoardColumns})`
+    : `${fixedBoardWidthPixels ?? 276}px`
+  const boardRowWidth = state.displaySettings.boardWidth === 'auto' || state.displaySettings.boardColumns === 'auto' ? '100%'
+    : `${state.displaySettings.boardColumns * (fixedBoardWidthPixels ?? 276) + (state.displaySettings.boardColumns - 1) * 10}px`
+  return <div className={`app-shell font-${state.displaySettings.fontSize} surface-preview-enabled`} style={{
+    '--primary': surfaceThemeColor,
+    '--primary-hover': `color-mix(in srgb, ${surfaceThemeColor} 82%, black)`,
+    '--primary-soft': `color-mix(in srgb, ${surfaceThemeColor} 14%, white)`,
+    '--preview-project-surface': `color-mix(in srgb, ${surfaceThemeColor} ${100 - surfaceBrightness.project}%, white)`,
+    '--preview-board-surface': `color-mix(in srgb, ${surfaceThemeColor} ${100 - surfaceBrightness.board}%, white)`,
+    '--preview-card-surface': `color-mix(in srgb, ${surfaceThemeColor} ${100 - surfaceBrightness.card}%, white)`,
+    '--preview-card-hover-surface': `color-mix(in srgb, ${surfaceThemeColor} ${Math.min(35, 103 - surfaceBrightness.card)}%, white)`
+  } as React.CSSProperties}>
     <aside className="sidebar">
       <button className={view === 'boards' ? 'brand-mark active' : 'brand-mark'} onClick={() => setView('boards')} title="项目主页" aria-label="项目主页">
         <svg className="projects-nav-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -1523,7 +2112,7 @@ function App(): React.JSX.Element {
         <button className={view === 'inbox' ? 'nav-button active' : 'nav-button'} onClick={() => setView('inbox')} title="收件箱" aria-label="收件箱">
           <MailOutlined className="inbox-nav-icon" />
         </button>
-        <button className={view === 'overdue' ? 'nav-button overdue-nav-button active' : 'nav-button overdue-nav-button'} onClick={() => setView('overdue')} title="过期" aria-label="过期"><OverdueIcon /></button>
+        <button className={view === 'overdue' ? 'nav-button overdue-nav-button active' : 'nav-button overdue-nav-button'} onClick={() => setView('overdue')} title="计划" aria-label="计划"><OverdueIcon /></button>
         <button className={view === 'flagged' ? 'nav-button active' : 'nav-button'} onClick={() => setView('flagged')} title="重要" aria-label="重要"><FlagIcon filled={view === 'flagged'} /></button>
         <button className={view === 'tags' ? 'nav-button active' : 'nav-button'} onClick={() => setView('tags')} title="Tag" aria-label="Tag">
           <TagsOutlined className="tags-nav-icon" />
@@ -1540,30 +2129,43 @@ function App(): React.JSX.Element {
         </button>
       </div>
     </aside>
-    <main className="workspace">
+    <main className={view === 'overdue' ? 'workspace plan-workspace' : 'workspace'}>
       {view === 'boards' && <ProjectBar projects={activeProjects} activeProjectId={activeProjectId}
         requestedRenameId={requestedProjectRenameId} onRenameRequestHandled={() => setRequestedProjectRenameId(null)}
         onSelect={selectActiveProject} onAdd={() => addProject('未命名项目')} onRename={renameProject} onReorder={reorderProjects} />}
       {view === 'boards' && <ProjectInfoBar project={selectedProject} projectCount={activeProjects.length}
         boardCount={visibleBoards.length} cardCount={visibleProjectCardCount}
-        tags={activeTags} tagViewConfig={activeProjectId ? state.tagViewSettings[activeProjectId] : undefined}
-        onTagViewChange={(projectId, config) => setState((current) => current ? {
-          ...current, tagViewSettings: { ...current.tagViewSettings, [projectId]: config }
-        } : current)}
+        tags={activeTags} tagViewSettings={activeProjectId ? state.tagViewSettings[activeProjectId] : undefined}
+        onTagViewChange={(projectId, settings) => setState((current) => {
+          if (!current) return current
+          const next = { ...current, tagViewSettings: { ...current.tagViewSettings, [projectId]: settings } }
+          void window.api.saveBoards(next).catch((error) => console.error('保存标签视图配置失败', error))
+          return next
+        })}
         onRenameRequest={setRequestedProjectRenameId} onArchive={archiveProject} onDelete={(projectId) => setProjectDeleted(projectId, true)} />}
       {view === 'flagged' && <>
         <header className="topbar">
           <div className="topbar-title"><h1>重要</h1><span>{displayedFlaggedCards.length}</span></div>
-          <label className="completed-toggle"><input type="checkbox" checked={includeCompleted} onChange={(event) => setIncludeCompleted(event.target.checked)} />显示已完成</label>
         </header>
-        <ChildDisplayFilterControl groupName="important" value={importantChildDisplay} onChange={setImportantChildDisplay} />
+        <ChildDisplayFilterControl groupName="important" value={importantChildDisplay} onChange={setImportantChildDisplay}
+          projects={activeProjects} selectedProjectIds={importantProjectIds} onProjectChange={setImportantProjectIds}
+          leading={<label className="completed-toggle"><input type="checkbox" checked={includeCompleted}
+            onChange={(event) => setIncludeCompleted(event.target.checked)} />显示已完成</label>} />
       </>}
       {view === 'overdue' && <>
-        <header className="topbar">
-          <div className="topbar-title"><h1>过期</h1><span>{filteredOverdueCards.length}</span></div>
+        <header className="topbar schedule-tabs-topbar plan-top-region">
+          <nav className="schedule-tabs" aria-label="计划页面">
+            {([['calendar', '日历'], ['schedule', '日程'], ['overdue', '过期']] as const).map(([tab, label]) =>
+              <button key={tab} className={scheduleTab === tab ? 'project-tab active' : 'project-tab'} onClick={() => setScheduleTab(tab)}>
+                {label}{tab === 'overdue' && <em>{filteredOverdueCards.length}</em>}
+              </button>)}
+          </nav>
         </header>
-        <ChildDisplayFilterControl groupName="overdue" value={overdueChildDisplay} onChange={setOverdueChildDisplay}
-          flaggedOnly={overdueFlaggedOnly} onFlaggedOnlyChange={setOverdueFlaggedOnly} />
+        <section className="plan-filter-region" aria-label="计划筛选与操作">
+          {scheduleTab === 'overdue' && <ChildDisplayFilterControl compact groupName="overdue" value={overdueChildDisplay} onChange={setOverdueChildDisplay}
+            projects={activeProjects} selectedProjectIds={overdueProjectIds} onProjectChange={setOverdueProjectIds}
+            flaggedOnly={overdueFlaggedOnly} onFlaggedOnlyChange={setOverdueFlaggedOnly} />}
+        </section>
       </>}
       {view === 'inbox' && <InboxHeader count={inboxVisibleCount} settings={state.inboxSettings}
         onChange={(inboxSettings) => setState((current) => current ? { ...current, inboxSettings } : current)} />}
@@ -1580,7 +2182,7 @@ function App(): React.JSX.Element {
       </section>}
 
       {view === 'boards' ? <div className="boards-stage" style={{
-        '--board-width': `${boardWidthPixels}px`, '--board-row-width': boardRowWidth
+        '--board-width': boardWidthValue, '--board-row-width': boardRowWidth
       } as React.CSSProperties}>
         <div className="boards-viewport" ref={boardsViewportRef}>
           <section className="boards-row">
@@ -1591,6 +2193,7 @@ function App(): React.JSX.Element {
               dragBoardId={dragBoardId} dragBoardTargetId={dragBoardTargetId}
               heightMode={state.displaySettings.boardHeight}
               parentDisplay={boardDisplaySelections[board.id] || 'in_progress'}
+              autoEditTitle={inlineEditingBoardId === board.id} onAutoEditTitleComplete={() => setInlineEditingBoardId(null)}
               onParentDisplayChange={(display) => {
                 setBoardDisplaySelections((current) => ({ ...current, [board.id]: display }))
                 setState((current) => current ? { ...current, boardDisplaySettings: { ...current.boardDisplaySettings, [board.id]: display } } : current)
@@ -1612,13 +2215,19 @@ function App(): React.JSX.Element {
                 if (boardId) setDragBoardTargetId(null)
               }}
               onBoardDragEnter={previewBoardOrder} onBoardDrop={dropBoard} onBoardDragEnd={finishBoardDrag}
-              onToggleCollapse={toggleCollapse} onDragStart={startCardDrag} onCardDragEnter={previewCardPosition} onDropCard={moveCard} onStartFocus={startFocus}
+              onToggleCollapse={toggleCollapse} onDragStart={startCardDrag} onCardDragEnter={previewCardPosition}
+              onDropCard={isTagViewActive ? moveCardInTagView : moveCard} onStartFocus={startFocus}
             />)}
             {!isTagViewActive && <button className="add-board" onClick={addBoard}>＋ 添加看板</button>}
           </section>
         </div>
         {hasMoreBoardsRight && <button className="boards-overflow-button right" title="显示右侧更多看板" aria-label="显示右侧更多看板"
-          onClick={() => boardsViewportRef.current?.scrollBy({ left: Math.max(boardWidthPixels, boardsViewportRef.current.clientWidth * .72), behavior: 'smooth' })}><OverflowIcon direction="right" /></button>}
+          onClick={() => {
+            const viewport = boardsViewportRef.current
+            if (!viewport) return
+            const boardStep = fixedBoardWidthPixels ?? (fixedBoardColumns ? viewport.clientWidth / fixedBoardColumns : 276)
+            viewport.scrollBy({ left: Math.max(boardStep, viewport.clientWidth * .72), behavior: 'smooth' })
+          }}><OverflowIcon direction="right" /></button>}
         {hasMoreBoardsBelow && <button className="boards-overflow-button down" title="显示下方更多看板" aria-label="显示下方更多看板"
           onClick={() => boardsViewportRef.current?.scrollBy({ top: Math.max(180, boardsViewportRef.current.clientHeight * .72), behavior: 'smooth' })}><OverflowIcon direction="down" /></button>}
       </div> : view === 'inbox' ? <section className="inbox-view">
@@ -1642,7 +2251,7 @@ function App(): React.JSX.Element {
           onAddCard={openNewCard} onEditCard={openCardEditor}
           onUpdateCard={updateCard} onCycleStatus={cycleCardStatus} onToggleCollapse={toggleCollapse}
           onDragStart={startCardDrag} onCardDragEnter={previewCardPosition} onDropCard={moveCard} onStartFocus={startFocus} />
-      </section> : view === 'overdue' ? <section className="overdue-view">
+      </section> : view === 'overdue' ? scheduleTab === 'overdue' ? <section className="overdue-view plan-content-region">
         <CardList board={overdueBoard} tags={activeTags} aggregate flat showTypeBadges contextCards={allCards}
           collapsed={collapsed} focus={state.focus} dragCardId={dragCardId}
           dragCardTargetId={dragCardTargetId} dragCardTargetBoardId={dragCardTargetBoardId}
@@ -1651,10 +2260,45 @@ function App(): React.JSX.Element {
           onAddCard={openNewCard} onEditCard={openCardEditor}
           onUpdateCard={updateCard} onCycleStatus={cycleCardStatus} onToggleCollapse={toggleCollapse}
           onDragStart={startCardDrag} onCardDragEnter={previewCardPosition} onDropCard={moveCard} onStartFocus={startFocus} />
+      </section> : scheduleTab === 'schedule' ? <section className="schedule-timeline-view plan-content-region">
+        {scheduledCards.length > 0 ? <Timeline mode="start" titleSpan={5} items={scheduledCards.map((card) => {
+          const sourceBoard = boardsById.get(card.boardId)
+          const timelineBoard: Board = sourceBoard ? {
+            ...sourceBoard,
+            filter: { staged: true, in_progress: true, done: true, deleted: false },
+            cards: [card]
+          } : {
+            id: card.boardId, projectId: '', status: 'active', statusChangedAt: null, title: '', color: '#a5aaa8', sort: 0, height: null,
+            filter: { staged: true, in_progress: true, done: true, deleted: false }, cards: [card]
+          }
+          const overdue = Boolean(card.dueAt && new Date(card.dueAt).getTime() < now && card.status === 'in_progress')
+          return {
+            color: card.status === 'done' ? '#42a57c' : card.status === 'staged' ? '#9da19f' : overdue ? '#d96767' : '#35b7a8',
+            title: <time dateTime={card.dueAt || undefined}>{formatScheduleDateTime(card.dueAt as string)}</time>,
+            content: <div className="schedule-timeline-card">
+              <CardList board={timelineBoard} tags={activeTags} aggregate flat disableDrag showTypeBadges contextCards={allCards}
+                collapsed={collapsed} focus={state.focus} dragCardId={dragCardId}
+                dragCardTargetId={dragCardTargetId} dragCardTargetBoardId={dragCardTargetBoardId}
+                autoEditCardId={inlineEditingCardId} onAutoEditComplete={() => setInlineEditingCardId(null)}
+                childDisplaySelections={childDisplaySelections} onSetChildDisplay={setChildDisplaySelection}
+                onAddCard={openNewCard} onEditCard={openCardEditor}
+                onUpdateCard={updateCard} onCycleStatus={cycleCardStatus} onToggleCollapse={toggleCollapse}
+                onDragStart={startCardDrag} onCardDragEnter={previewCardPosition} onDropCard={moveCard} onStartFocus={startFocus} />
+            </div>
+          }
+        })} /> : <div className="schedule-timeline-empty"><strong>暂无日程</strong><span>为卡片设置截止时间后，会显示在这里</span></div>}
+      </section> : <section className="schedule-placeholder plan-content-region">
+        <div><strong>日历</strong><span>页面内容将在此处展示</span></div>
       </section> : view === 'tags' ? <section className="tags-page">
-        <TagManager tags={activeTags} selectedTagId={selectedTagId} onSelect={setSelectedTagId} onAdd={addTag} onDelete={deleteTag} onReorder={reorderTags} />
+        <TagManager tags={activeTags} selectedTagId={selectedTagId} onSelect={setSelectedTagId} onAdd={addTag} onRename={renameTag} onDelete={deleteTag} onReorder={reorderTags} />
         <section className="tag-cards-panel">
-          <header><div><h2>{activeTags.find((tag) => tag.id === selectedTagId)?.title || '选择 Tag'}</h2></div><strong>{taggedCards.length}</strong></header>
+          <header>
+            <div className="tag-cards-title"><h2>{activeTags.find((tag) => tag.id === selectedTagId)?.title || '选择 Tag'}</h2><strong>{taggedCards.length}</strong></div>
+            <div className="tag-cards-header-actions">
+              <TagProjectFilter projects={activeProjects} selectedIds={tagProjectIds} onChange={setTagProjectIds} />
+              <BoardDisplayAction value={tagCardStatus} managementOpen={false} onOpen={() => undefined} onChange={setTagCardStatus} />
+            </div>
+          </header>
           {selectedTagId ? <CardList board={tagBoard} tags={activeTags} aggregate flat contextCards={allCards}
             collapsed={collapsed} focus={state.focus} dragCardId={dragCardId}
             dragCardTargetId={dragCardTargetId} dragCardTargetBoardId={dragCardTargetBoardId}
@@ -1670,18 +2314,23 @@ function App(): React.JSX.Element {
         projects={state.projects} boards={state.boards}
         switching={storageSwitching} onCreate={() => selectDatabase('create')} onChoose={() => selectDatabase('choose')}
         onUseDefault={() => selectDatabase('default')} boardColumns={state.displaySettings.boardColumns} boardWidth={state.displaySettings.boardWidth}
-        boardHeight={state.displaySettings.boardHeight} fontSize={state.displaySettings.fontSize}
-        dockTimerEnabled={state.displaySettings.dockTimerEnabled} focusDurationMinutes={state.focusSettings.durationMinutes} inboxShortcut={state.shortcuts.inbox}
+        boardHeight={state.displaySettings.boardHeight} fontSize={state.displaySettings.fontSize} themeSettings={state.themeSettings}
+        dockTimerEnabled={state.displaySettings.dockTimerEnabled} focusDurationMinutes={state.focusSettings.durationMinutes}
+        inboxShortcut={state.shortcuts.inbox} appShortcuts={state.shortcuts}
         onBoardColumnsChange={(boardColumns) => setState((current) => current ? { ...current, displaySettings: { ...current.displaySettings, boardColumns } } : current)}
         onBoardWidthChange={(boardWidth) => setState((current) => current ? { ...current, displaySettings: { ...current.displaySettings, boardWidth } } : current)}
         onBoardHeightChange={setBoardHeightMode}
         onFontSizeChange={(fontSize) => setState((current) => current ? { ...current, displaySettings: { ...current.displaySettings, fontSize } } : current)}
+        onThemeSettingsChange={(themeSettings) => setState((current) => current ? { ...current, themeSettings } : current)}
+        onCreateTheme={() => openThemeEditor(null)} onEditTheme={(themeId) => openThemeEditor(themeId)} onDeleteTheme={deleteTheme}
         onDockTimerChange={(dockTimerEnabled) => setState((current) => current ? { ...current, displaySettings: { ...current.displaySettings, dockTimerEnabled } } : current)}
         onFocusDurationChange={(durationMinutes) => setState((current) => current ? { ...current, focusSettings: { durationMinutes } } : current)}
         onInboxShortcutChange={(inbox) => setState((current) => current ? { ...current, shortcuts: { ...current.shortcuts, inbox } } : current)}
-        onRestoreProject={restoreProject} onRestoreBoard={(boardId) => setBoardStatus(boardId, 'active')} onRestoreCard={restoreCard}
-        onPermanentlyDelete={permanentlyDelete} />}
+        onAppShortcutChange={(key, value) => setState((current) => current ? { ...current, shortcuts: { ...current.shortcuts, [key]: value } } : current)}
+      onRestoreProject={restoreProject} onRestoreBoard={(boardId) => setBoardStatus(boardId, 'active')} onRestoreCard={restoreCard}
+      onPermanentlyDelete={permanentlyDelete} />}
     </main>
+    <footer className="app-bottom-bar" aria-label="底部操作栏" />
     <button type="button" className="global-search-trigger"
       onPointerDown={(event) => event.stopPropagation()} onClick={() => setSearchOpen(true)} aria-label="搜索" title="搜索">
       <SearchIcon />
@@ -1690,10 +2339,16 @@ function App(): React.JSX.Element {
     {editingCard && editingCardAnchor && <CardModal card={editingCard} anchor={editingCardAnchor} parent={editingCard.parentId ? allCards.find((card) => card.id === editingCard.parentId) : undefined}
       hasChildren={allCards.some((card) => card.parentId === editingCard.id)} onChange={setEditingCard} onClose={closeCardEditor} onSave={saveCard} />}
     {editingBoard && <BoardModal value={editingBoard} onChange={setEditingBoard} onClose={() => setEditingBoard(null)} onSave={saveBoard} />}
+    {themeEditor && <ThemeEditorPopover palette={state.themeSettings.customDraft}
+      initialTitle={themeEditor.themeId ? state.themeSettings.themes.find((theme) => theme.id === themeEditor.themeId)?.title || '' : ''}
+      editing={Boolean(themeEditor.themeId)} onChange={updateThemeEditorPalette} onCancel={cancelThemeEditor} onSave={saveThemeEditor} />}
     {projectManagerOpen && <ProjectManagerModal projects={state.projects} onClose={() => setProjectManagerOpen(false)}
       onAdd={addProject} onRename={renameProject} onReorder={reorderProjects}
       onDelete={(project) => { if (window.confirm(`删除项目“${project.title}”？项目下的数据会保留，可随时恢复。`)) setProjectDeleted(project.id, true) }}
       onRestore={(projectId) => setProjectDeleted(projectId, false)} />}
+    {historyNotice && <div className="history-notice" role="status">{historyNotice}</div>}
+    {hoverTooltip && createPortal(<div className={hoverTooltip.above ? 'global-hover-tooltip above' : 'global-hover-tooltip'}
+      style={{ left: hoverTooltip.left, top: hoverTooltip.top }} role="tooltip">{hoverTooltip.text}</div>, document.body)}
   </div>
 }
 
@@ -1925,7 +2580,7 @@ function SearchDialog({ state, onClose, onOpenResult }: {
         </button>
         <div className="search-filter-control">
           <button className={cardStatuses.size ? 'search-filter-button selected' : 'search-filter-button'} onClick={() => setOpenFilter(openFilter === 'card' ? null : 'card')}>
-            卡片{cardStatuses.size ? ` · ${cardStatuses.size}` : ''}<span>⌄</span>
+            卡片状态{cardStatuses.size ? ` · ${cardStatuses.size}` : ''}<span>⌄</span>
           </button>
           {openFilter === 'card' && <div className="search-filter-popover">
             {([['staged', '已放弃'], ['done', '已完成'], ['in_progress', '进行中']] as const).map(([value, label]) => <label key={value}>
@@ -2069,27 +2724,33 @@ function ProjectBar({ projects, activeProjectId, requestedRenameId, onRenameRequ
   </header>
 }
 
-function ProjectInfoBar({ project, projectCount, boardCount, cardCount, tags, tagViewConfig, onTagViewChange, onRenameRequest, onArchive, onDelete }: {
+function ProjectInfoBar({ project, projectCount, boardCount, cardCount, tags, tagViewSettings, onTagViewChange, onRenameRequest, onArchive, onDelete }: {
   project: Project | null
   projectCount: number
   boardCount: number
   cardCount: number
   tags: CardTag[]
-  tagViewConfig?: TagViewConfig
-  onTagViewChange: (projectId: string, config: TagViewConfig) => void
+  tagViewSettings?: ProjectTagViewSettings
+  onTagViewChange: (projectId: string, settings: ProjectTagViewSettings) => void
   onRenameRequest: (projectId: string) => void
   onArchive: (projectId: string) => void
   onDelete: (projectId: string) => void
 }): React.JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null)
+  const tagViewMenuRef = useRef<HTMLDivElement | null>(null)
   const [open, setOpen] = useState(false)
   const [pendingAction, setPendingAction] = useState<'archive' | 'delete' | null>(null)
-  const [tagViewOpen, setTagViewOpen] = useState(false)
+  const [tagViewMenuOpen, setTagViewMenuOpen] = useState(false)
+  const [tagViewEditor, setTagViewEditor] = useState<TagViewConfig | null | undefined>(undefined)
+  const projectTagViews = tagViewSettings || { activeViewId: null, views: [] }
+  const activeTagView = projectTagViews.views.find((config) => config.id === projectTagViews.activeViewId)
+  const pinnedTagViews = projectTagViews.views.filter((config) => config.pinned)
 
   useEffect(() => {
     setOpen(false)
     setPendingAction(null)
-    setTagViewOpen(false)
+    setTagViewMenuOpen(false)
+    setTagViewEditor(undefined)
   }, [project?.id])
 
   useEffect(() => {
@@ -2103,6 +2764,15 @@ function ProjectInfoBar({ project, projectCount, boardCount, cardCount, tags, ta
     document.addEventListener('pointerdown', close)
     return () => document.removeEventListener('pointerdown', close)
   }, [open])
+
+  useEffect(() => {
+    if (!tagViewMenuOpen) return
+    const close = (event: PointerEvent): void => {
+      if (!tagViewMenuRef.current?.contains(event.target as Node)) setTagViewMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', close)
+    return () => document.removeEventListener('pointerdown', close)
+  }, [tagViewMenuOpen])
 
   function startRename(): void {
     if (!project) return
@@ -2119,15 +2789,77 @@ function ProjectInfoBar({ project, projectCount, boardCount, cardCount, tags, ta
     setPendingAction(null)
   }
 
+  function saveTagView(config: TagViewConfig): void {
+    if (!project) return
+    const normalizedConfig = { ...config, statuses: { ...config.statuses, deleted: false } }
+    const exists = projectTagViews.views.some((view) => view.id === config.id)
+    const views = exists
+      ? projectTagViews.views.map((view) => view.id === config.id ? normalizedConfig : view)
+      : [...projectTagViews.views, normalizedConfig]
+    onTagViewChange(project.id, { activeViewId: normalizedConfig.id, views })
+    setTagViewEditor(undefined)
+  }
+
+  function deleteTagView(configId: string): void {
+    if (!project) return
+    const views = projectTagViews.views.filter((view) => view.id !== configId)
+    onTagViewChange(project.id, {
+      activeViewId: projectTagViews.activeViewId === configId ? null : projectTagViews.activeViewId,
+      views
+    })
+  }
+
+  function togglePinnedTagView(configId: string): void {
+    if (!project) return
+    onTagViewChange(project.id, {
+      ...projectTagViews,
+      views: projectTagViews.views.map((view) => view.id === configId ? { ...view, pinned: !view.pinned } : view)
+    })
+  }
+
   return <section className="project-info-bar">
     <div className="project-info-copy">
       <span>{project ? `${boardCount} 个看板 · ${cardCount} 张卡片` : `${projectCount} 个项目 · ${boardCount} 个看板 · ${cardCount} 张卡片`}</span>
     </div>
     <div className="project-info-actions">
-      <button className={tagViewConfig?.enabled ? 'tag-view-button active' : 'tag-view-button'} disabled={!project}
-        onClick={() => setTagViewOpen(true)} title="配置标签视图" aria-label="配置标签视图">
-        <TagOutlined /><span>标签视图</span>
-      </button>
+      {(activeTagView || pinnedTagViews.length > 0) && project && <button className={!activeTagView ? 'main-view-button active' : 'main-view-button'}
+        onClick={() => onTagViewChange(project.id, { ...projectTagViews, activeViewId: null })}>主视图</button>}
+      {project && pinnedTagViews.map((config) => {
+        const category = tags.find((tag) => tag.id === config.categoryTagId)
+        return <button key={config.id} className={config.id === projectTagViews.activeViewId ? 'pinned-tag-view-button active' : 'pinned-tag-view-button'}
+          onClick={() => onTagViewChange(project.id, { ...projectTagViews, activeViewId: config.id })}>
+          <TagOutlined /><span>{category?.title || '已失效标签视图'}</span>
+        </button>
+      })}
+      <div className="tag-view-menu" ref={tagViewMenuRef}>
+        <button className={activeTagView || tagViewMenuOpen ? 'tag-view-button active' : 'tag-view-button'} disabled={!project}
+          onClick={() => setTagViewMenuOpen((current) => !current)} title="标签视图" aria-label="标签视图">
+          <TagsOutlined /><span>标签视图</span>
+        </button>
+        {tagViewMenuOpen && <div className="tag-view-popover">
+          {projectTagViews.views.map((config) => {
+            const category = tags.find((tag) => tag.id === config.categoryTagId)
+            return <div className={config.id === projectTagViews.activeViewId ? 'tag-view-menu-item active' : 'tag-view-menu-item'} key={config.id}>
+              <button className="tag-view-menu-select" onClick={() => {
+                if (project) onTagViewChange(project.id, { ...projectTagViews, activeViewId: config.id })
+                setTagViewMenuOpen(false)
+              }}><TagOutlined /><span>{category?.title || '已失效的标签类别'}</span></button>
+              <button className={config.pinned ? 'tag-view-menu-icon pinned' : 'tag-view-menu-icon'} onClick={() => togglePinnedTagView(config.id)}
+                title={config.pinned ? '取消快捷方式' : '添加到主视图右侧'} aria-label={config.pinned ? '取消快捷方式' : '添加到主视图右侧'}>
+                <PushpinOutlined />
+              </button>
+              <button className="tag-view-menu-icon" onClick={() => { setTagViewMenuOpen(false); setTagViewEditor(config) }} title="编辑标签视图" aria-label="编辑标签视图">
+                <FormOutlined />
+              </button>
+              <button className="tag-view-menu-icon danger" onClick={() => deleteTagView(config.id)} title="删除标签视图" aria-label="删除标签视图">
+                <CardActionIcon name="delete" />
+              </button>
+            </div>
+          })}
+          {projectTagViews.views.length > 0 && <div className="filter-divider" />}
+          <button className="tag-view-add" onClick={() => { setTagViewMenuOpen(false); setTagViewEditor(null) }} aria-label="新建标签视图" title="新建标签视图">＋</button>
+        </div>}
+      </div>
       <div className="project-info-menu" ref={containerRef}>
         <button className={open ? 'icon-button active' : 'icon-button'} onClick={() => { setOpen((value) => !value); setPendingAction(null) }}
           title="项目管理" aria-label="项目管理"><MoreIcon /></button>
@@ -2150,8 +2882,8 @@ function ProjectInfoBar({ project, projectCount, boardCount, cardCount, tags, ta
         </div>}
       </div>
     </div>
-    {tagViewOpen && project && <TagViewConfigModal tags={tags} value={tagViewConfig}
-      onClose={() => setTagViewOpen(false)} onSave={(config) => { onTagViewChange(project.id, config); setTagViewOpen(false) }} />}
+    {tagViewEditor !== undefined && project && <TagViewConfigModal tags={tags} value={tagViewEditor || undefined}
+      onClose={() => setTagViewEditor(undefined)} onSave={saveTagView} />}
   </section>
 }
 
@@ -2164,7 +2896,8 @@ function TagViewConfigModal({ tags, value, onClose, onSave }: {
   const categories = tags.filter((tag) => tags.some((child) => child.parentId === tag.id))
   const fallbackCategoryId = categories[0]?.id || ''
   const [draft, setDraft] = useState<TagViewConfig>(() => value || {
-    enabled: true,
+    id: uid(),
+    pinned: false,
     categoryTagId: fallbackCategoryId,
     statuses: { staged: false, in_progress: true, done: false, deleted: false }
   })
@@ -2183,9 +2916,9 @@ function TagViewConfigModal({ tags, value, onClose, onSave }: {
           <small className="field-hint">该类别的直接子标签将作为动态看板；更深层子标签会归入其上级枚举值。</small>
         </label>
         <div className="board-settings-section">
-          <strong>卡片状态筛选</strong>
+          <strong>卡片状态</strong>
           <div className="board-settings-options">
-            {EDITABLE_STATUSES.concat('deleted').map((status) => <label key={status}>
+            {EDITABLE_STATUSES.map((status) => <label key={status}>
               <input type="checkbox" checked={draft.statuses[status]}
                 onChange={(event) => setDraft((current) => ({
                   ...current, statuses: { ...current.statuses, [status]: event.target.checked }
@@ -2197,10 +2930,9 @@ function TagViewConfigModal({ tags, value, onClose, onSave }: {
         {!hasStatus && <small className="tag-view-error">请至少选择一种卡片状态</small>}
       </div>
       <footer>
-        {value?.enabled && <button className="secondary-button tag-view-disable" onClick={() => onSave({ ...draft, enabled: false })}>恢复普通视图</button>}
         <button className="secondary-button" onClick={onClose}>取消</button>
         <button className="primary-button" disabled={!draft.categoryTagId || !hasStatus}
-          onClick={() => onSave({ ...draft, enabled: true })}>确定</button>
+          onClick={() => onSave(draft)}>确定</button>
       </footer>
     </section>
   </div>, document.body)
@@ -2234,12 +2966,17 @@ function StatisticsPage({ statistics }: { statistics: StatisticsData }): React.J
   </section>
 }
 
-function ChildDisplayFilterControl({ groupName, value, onChange, flaggedOnly, onFlaggedOnlyChange }: {
+function ChildDisplayFilterControl({ groupName, value, onChange, projects, selectedProjectIds, onProjectChange, flaggedOnly, onFlaggedOnlyChange, leading, compact = false }: {
   groupName: string
   value: 'first' | 'all'
   onChange: (value: 'first' | 'all') => void
+  projects: Project[]
+  selectedProjectIds: Set<string>
+  onProjectChange: (selectedIds: Set<string>) => void
   flaggedOnly?: boolean
   onFlaggedOnlyChange?: (value: boolean) => void
+  leading?: React.ReactNode
+  compact?: boolean
 }): React.JSX.Element {
   const [open, setOpen] = useState(false)
   const containerRef = useRef<HTMLDivElement | null>(null)
@@ -2253,13 +2990,17 @@ function ChildDisplayFilterControl({ groupName, value, onChange, flaggedOnly, on
     return () => document.removeEventListener('pointerdown', close)
   }, [open])
 
-  return <section className="overdue-display-bar">
-    {onFlaggedOnlyChange && <button className={flaggedOnly ? 'overdue-flag-filter selected' : 'overdue-flag-filter'}
-      aria-pressed={Boolean(flaggedOnly)} data-tooltip={flaggedOnly ? '显示全部过期任务' : '只显示重要的过期任务'}
-      aria-label="只显示重要的过期任务" onClick={() => onFlaggedOnlyChange(!flaggedOnly)}>
-      <FlagIcon filled={flaggedOnly} />
-    </button>}
+  return <section className={compact ? 'overdue-display-bar compact' : 'overdue-display-bar'}>
+    <div className="page-display-leading">
+      {leading}
+    </div>
     <div className="overdue-display-action" ref={containerRef}>
+      <TagProjectFilter projects={projects} selectedIds={selectedProjectIds} onChange={onProjectChange} />
+      {onFlaggedOnlyChange && <button className={flaggedOnly ? 'overdue-flag-filter selected' : 'overdue-flag-filter'}
+        aria-pressed={Boolean(flaggedOnly)} data-tooltip={flaggedOnly ? '显示全部过期任务' : '只显示重要的过期任务'}
+        aria-label="只显示重要的过期任务" onClick={() => onFlaggedOnlyChange(!flaggedOnly)}>
+        <FlagIcon filled={flaggedOnly} />
+      </button>}
       <button className={open ? 'overdue-display-button active' : 'overdue-display-button'}
         onClick={() => setOpen((current) => !current)} data-tooltip="顺序子卡片显示" aria-label="顺序子卡片显示">
         <EyeIcon />
@@ -2296,23 +3037,28 @@ function InboxHeader({ count, settings, onChange }: {
   const options: Array<{ key: keyof BoardState['inboxSettings']; label: string }> = [
     { key: 'in_progress', label: '进行中' },
     { key: 'done', label: '已完成' },
-    { key: 'deleted', label: '已删除' }
+    { key: 'staged', label: '已放弃' }
   ]
-  return <header className="topbar inbox-topbar">
-    <div className="topbar-title"><h1>收件箱</h1><span>{count}</span></div>
-    <div className="inbox-manager" ref={containerRef}>
-      <button className={open ? 'icon-button active' : 'icon-button'} onClick={() => setOpen((value) => !value)}
-        title="收件箱管理" aria-label="收件箱管理"><ManageIcon /></button>
-      {open && <div className="inbox-manager-popover" onPointerDown={(event) => event.stopPropagation()}>
-        <strong>显示类型</strong>
-        {options.map((option) => <label key={option.key}>
-          <input type="checkbox" checked={settings[option.key]}
-            onChange={(event) => onChange({ ...settings, [option.key]: event.target.checked })} />
-          {option.label}
-        </label>)}
-      </div>}
-    </div>
-  </header>
+  return <>
+    <header className="topbar inbox-topbar">
+      <div className="topbar-title"><h1>收件箱</h1><span>{count}</span></div>
+    </header>
+    <section className="overdue-display-bar inbox-display-bar">
+      <div className="page-display-leading" />
+      <div className="inbox-manager overdue-display-action" ref={containerRef}>
+        <button className={open ? 'overdue-display-button active' : 'overdue-display-button'} onClick={() => setOpen((value) => !value)}
+          data-tooltip="卡片状态" aria-label="收件箱卡片状态"><EyeIcon /></button>
+        {open && <div className="inbox-manager-popover" onPointerDown={(event) => event.stopPropagation()}>
+          <strong>卡片状态</strong>
+          {options.map((option) => <label key={option.key}>
+            <input type="checkbox" checked={settings[option.key]}
+              onChange={(event) => onChange({ ...settings, [option.key]: event.target.checked })} />
+            {option.label}
+          </label>)}
+        </div>}
+      </div>
+    </section>
+  </>
 }
 
 function DataRestoreAction({ item }: { item: DataManagementItem }): React.JSX.Element {
@@ -2420,7 +3166,74 @@ function DataPermanentDeleteAction({ item }: { item: DataManagementItem }): Reac
   </div>
 }
 
-function SettingsPage({ projectCount, boardCount, cardCount, projects, boards, switching, onCreate, onChoose, onUseDefault, boardColumns, boardWidth, boardHeight, fontSize, dockTimerEnabled, focusDurationMinutes, inboxShortcut, onBoardColumnsChange, onBoardWidthChange, onBoardHeightChange, onFontSizeChange, onDockTimerChange, onFocusDurationChange, onInboxShortcutChange, onRestoreProject, onRestoreBoard, onRestoreCard, onPermanentlyDelete }: {
+function ThemeEditorPopover({ palette, initialTitle, editing, onChange, onCancel, onSave }: {
+  palette: ThemePalette
+  initialTitle: string
+  editing: boolean
+  onChange: (palette: ThemePalette) => void
+  onCancel: () => void
+  onSave: (title: string) => void
+}): React.JSX.Element {
+  const [title, setTitle] = useState(initialTitle)
+  const [notice, setNotice] = useState('')
+  const rgb = hexToRgb(palette.color)
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') onCancel()
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [onCancel])
+
+  function update(patch: Partial<ThemePalette>): void {
+    setNotice('')
+    onChange(normalizeThemePalette({ ...palette, ...patch }))
+  }
+
+  function updateChannel(channel: 'r' | 'g' | 'b', value: number): void {
+    const next = { ...rgb, [channel]: Math.min(255, Math.max(0, Number(value) || 0)) }
+    update({ color: rgbToHex(next.r, next.g, next.b) })
+  }
+
+  function submit(): void {
+    if (!title.trim()) {
+      setNotice('请输入主题名称')
+      return
+    }
+    onSave(title)
+  }
+
+  return createPortal(<aside className="theme-floating-editor" role="dialog" aria-label={editing ? '编辑主题' : '新建自定义主题'}>
+    <header><div><strong>{editing ? '编辑主题' : '自定义主题'}</strong><span>调整后可在项目页面实时预览</span></div>
+      <button type="button" className="icon-button" onClick={onCancel} aria-label="关闭">×</button></header>
+    <div className="theme-editor">
+      <div className="theme-color-editor">
+        <label className="theme-color-well" title="选择主题颜色"><input type="color" value={palette.color}
+          onChange={(event) => update({ color: event.target.value })} /><span style={{ background: palette.color }} /></label>
+        <span className="theme-hex-value">{palette.color.toUpperCase()}</span>
+        {(['r', 'g', 'b'] as const).map((channel) => <label className="theme-rgb-channel" key={channel}>
+          <span>{channel.toUpperCase()}</span><input type="number" min="0" max="255" value={rgb[channel]}
+            onChange={(event) => updateChannel(channel, Number(event.target.value))} />
+        </label>)}
+      </div>
+      <div className="theme-brightness-controls">
+        {([['projectBrightness', '项目'], ['boardBrightness', '看板'], ['cardBrightness', '卡片']] as const).map(([key, label]) => <label key={key}>
+          <span>{label}</span><input type="range" min="60" max="100" step="1" value={palette[key]}
+            onChange={(event) => update({ [key]: Number(event.target.value) })} /><strong>{palette[key]}</strong>
+        </label>)}
+      </div>
+      <div className="theme-save-row">
+        <input autoFocus type="text" maxLength={30} value={title} placeholder="输入主题名称"
+          onChange={(event) => { setTitle(event.target.value); setNotice('') }} onKeyDown={(event) => { if (event.key === 'Enter') submit() }} />
+        {notice && <span className="theme-save-notice">{notice}</span>}
+      </div>
+    </div>
+    <footer><button type="button" onClick={onCancel}>取消</button><button type="button" className="primary" onClick={submit}>{editing ? '保存修改' : '保存主题'}</button></footer>
+  </aside>, document.body)
+}
+
+function SettingsPage({ projectCount, boardCount, cardCount, projects, boards, switching, onCreate, onChoose, onUseDefault, boardColumns, boardWidth, boardHeight, fontSize, themeSettings, dockTimerEnabled, focusDurationMinutes, inboxShortcut, appShortcuts, onBoardColumnsChange, onBoardWidthChange, onBoardHeightChange, onFontSizeChange, onThemeSettingsChange, onCreateTheme, onEditTheme, onDeleteTheme, onDockTimerChange, onFocusDurationChange, onInboxShortcutChange, onAppShortcutChange, onRestoreProject, onRestoreBoard, onRestoreCard, onPermanentlyDelete }: {
   projectCount: number
   boardCount: number
   cardCount: number
@@ -2431,19 +3244,26 @@ function SettingsPage({ projectCount, boardCount, cardCount, projects, boards, s
   onChoose: () => Promise<DatabaseInfo | null>
   onUseDefault: () => Promise<DatabaseInfo | null>
   boardColumns: number | 'auto'
-  boardWidth: 'narrow' | 'medium' | 'wide'
+  boardWidth: 'auto' | 'narrow' | 'medium' | 'wide'
   boardHeight: 'small' | 'medium' | 'large'
   fontSize: 'small' | 'medium' | 'large'
+  themeSettings: ThemeSettings
   dockTimerEnabled: boolean
   focusDurationMinutes: number
   inboxShortcut: string
+  appShortcuts: ShortcutSettings
   onBoardColumnsChange: (value: number | 'auto') => void
-  onBoardWidthChange: (value: 'narrow' | 'medium' | 'wide') => void
+  onBoardWidthChange: (value: 'auto' | 'narrow' | 'medium' | 'wide') => void
   onBoardHeightChange: (value: 'small' | 'medium' | 'large') => void
   onFontSizeChange: (value: 'small' | 'medium' | 'large') => void
+  onThemeSettingsChange: (value: ThemeSettings) => void
+  onCreateTheme: () => void
+  onEditTheme: (themeId: string) => void
+  onDeleteTheme: (themeId: string) => void
   onDockTimerChange: (value: boolean) => void
   onFocusDurationChange: (value: number) => void
   onInboxShortcutChange: (value: string) => void
+  onAppShortcutChange: (key: AppShortcutKey, value: string) => void
   onRestoreProject: (projectId: string) => void
   onRestoreBoard: (boardId: string) => void
   onRestoreCard: (cardId: string) => void
@@ -2455,6 +3275,9 @@ function SettingsPage({ projectCount, boardCount, cardCount, projects, boards, s
   const [dataManagementTab, setDataManagementTab] = useState<'archived' | 'deleted'>('archived')
   const [capturingShortcut, setCapturingShortcut] = useState(false)
   const [shortcutError, setShortcutError] = useState('')
+  const [capturingAppShortcut, setCapturingAppShortcut] = useState<AppShortcutKey | null>(null)
+  const [appShortcutError, setAppShortcutError] = useState('')
+  const [displaySettingNotice, setDisplaySettingNotice] = useState('')
   const shortcutButtonRef = useRef<HTMLButtonElement | null>(null)
 
   useEffect(() => {
@@ -2495,6 +3318,15 @@ function SettingsPage({ projectCount, boardCount, cardCount, projects, boards, s
       if (!['Meta', 'Control', 'Shift', 'Alt'].includes(event.key)) setShortcutError('请使用至少一个修饰键')
       return
     }
+    const normalizedAccelerator = /^[1-9]$/.test(event.key) ? normalizeIndexedShortcut(canonicalShortcut(accelerator)) : canonicalShortcut(accelerator)
+    const conflictsWithAppShortcut = (Object.entries(appShortcuts) as Array<[keyof ShortcutSettings, string]>).some(([key, value]) =>
+      key !== 'inbox' && (key === 'projectTabs' || key === 'planTabs'
+        ? canonicalShortcut(value) === normalizedAccelerator : canonicalShortcut(value) === canonicalShortcut(accelerator)))
+    if (conflictsWithAppShortcut) {
+      setShortcutError('这个组合键已被应用内功能使用，请换一个')
+      await window.api.startShortcutCapture()
+      return
+    }
     const result = await window.api.setInboxShortcut(accelerator)
     if (!result.success) {
       setShortcutError(result.error || '快捷键注册失败')
@@ -2504,6 +3336,54 @@ function SettingsPage({ projectCount, boardCount, cardCount, projects, boards, s
     onInboxShortcutChange(accelerator)
     setShortcutError('')
     setCapturingShortcut(false)
+  }
+
+  function captureAppShortcut(event: React.KeyboardEvent<HTMLButtonElement>, key: AppShortcutKey, indexedMaximum?: number): void {
+    event.preventDefault()
+    event.stopPropagation()
+    if (event.key === 'Escape') {
+      setCapturingAppShortcut(null)
+      setAppShortcutError('')
+      return
+    }
+    if (indexedMaximum && (!/^[1-9]$/.test(event.key) || Number(event.key) > indexedMaximum)) {
+      if (!['Meta', 'Control', 'Shift', 'Alt'].includes(event.key)) setAppShortcutError(`请按修饰键与 1…${indexedMaximum} 中的任意数字键`)
+      return
+    }
+    const captured = acceleratorFromEvent(event)
+    if (!captured) {
+      if (!['Meta', 'Control', 'Shift', 'Alt'].includes(event.key)) setAppShortcutError('请使用至少一个修饰键')
+      return
+    }
+    const accelerator = indexedMaximum ? normalizeIndexedShortcut(captured) : captured
+    const duplicate = (Object.entries(appShortcuts) as Array<[keyof ShortcutSettings, string]>).find(([otherKey, value]) => {
+      if (otherKey === key || otherKey === 'inbox') return false
+      if ((key === 'projectTabs' && otherKey === 'planTabs') || (key === 'planTabs' && otherKey === 'projectTabs')) return false
+      const otherIndexed = otherKey === 'projectTabs' || otherKey === 'planTabs'
+      if (indexedMaximum && otherIndexed) return value === accelerator
+      if (indexedMaximum) return /^\d$/.test(value.split('+').at(-1) || '') && normalizeIndexedShortcut(value) === accelerator
+      if (otherIndexed) return /^\d$/.test(captured.split('+').at(-1) || '') && normalizeIndexedShortcut(captured) === value
+      return value === accelerator
+    })
+    const canonicalInboxShortcut = canonicalShortcut(inboxShortcut)
+    const normalizedInboxShortcut = /^\d$/.test(canonicalInboxShortcut.split('+').at(-1) || '')
+      ? normalizeIndexedShortcut(canonicalInboxShortcut) : canonicalInboxShortcut
+    if (duplicate || canonicalInboxShortcut === canonicalShortcut(accelerator)
+      || (indexedMaximum && normalizedInboxShortcut === canonicalShortcut(accelerator))) {
+      setAppShortcutError('这个组合键已被其他功能使用，请换一个')
+      return
+    }
+    onAppShortcutChange(key, accelerator)
+    setAppShortcutError('')
+    setCapturingAppShortcut(null)
+  }
+
+  function selectTheme(activeThemeId: string): void {
+    if (activeThemeId === 'custom') {
+      onCreateTheme()
+      return
+    }
+    onThemeSettingsChange({ ...themeSettings, activeThemeId })
   }
 
   const projectsById = new Map(projects.map((project) => [project.id, project]))
@@ -2631,17 +3511,63 @@ function SettingsPage({ projectCount, boardCount, cardCount, projects, boards, s
       </section>
     </div>
       : activeTab === 'display' ? <div className="settings-panel">
+        <section className="theme-settings-block">
+          <div className="settings-row theme-selector-row">
+            <div><strong>主题</strong><span>设置应用配色以及项目、看板和卡片的层级亮度</span></div>
+            <div className="theme-selector-control">
+              <span className="theme-color-preview" style={{ background: themeSettings.activeThemeId === 'default'
+                ? DEFAULT_THEME_PALETTE.color
+                : themeSettings.activeThemeId === 'custom' ? themeSettings.customDraft.color
+                  : themeSettings.themes.find((theme) => theme.id === themeSettings.activeThemeId)?.color || DEFAULT_THEME_PALETTE.color }} />
+              <select className="settings-select" value={themeSettings.activeThemeId} onChange={(event) => selectTheme(event.target.value)}>
+                <option value="default">默认主题</option>
+                {themeSettings.themes.map((theme) => <option key={theme.id} value={theme.id}>{theme.title}</option>)}
+                <option value="custom">新建自定义主题…</option>
+              </select>
+            </div>
+          </div>
+          {themeSettings.activeThemeId === 'default' && <div className="theme-summary">
+            <span><i style={{ background: DEFAULT_THEME_PALETTE.color }} />RGB 179, 179, 179</span>
+            <span>项目 {DEFAULT_THEME_PALETTE.projectBrightness}</span><span>看板 {DEFAULT_THEME_PALETTE.boardBrightness}</span><span>卡片 {DEFAULT_THEME_PALETTE.cardBrightness}</span>
+          </div>}
+          {themeSettings.activeThemeId !== 'default' && themeSettings.activeThemeId !== 'custom' && (() => {
+            const theme = themeSettings.themes.find((item) => item.id === themeSettings.activeThemeId)
+            if (!theme) return null
+            const rgb = hexToRgb(theme.color)
+            return <div className="theme-summary"><span><i style={{ background: theme.color }} />RGB {rgb.r}, {rgb.g}, {rgb.b}</span>
+              <span>项目 {theme.projectBrightness}</span><span>看板 {theme.boardBrightness}</span><span>卡片 {theme.cardBrightness}</span>
+              <div className="theme-actions"><button type="button" onClick={() => onEditTheme(theme.id)}>编辑</button>
+                <button type="button" className="danger" onClick={() => onDeleteTheme(theme.id)}>删除</button></div></div>
+          })()}
+        </section>
         <div className="settings-row"><div><strong>每行看板列数</strong><span>项目主页同时展示的看板数量</span></div>
-          <select className="settings-select" value={boardColumns} onChange={(event) => onBoardColumnsChange(event.target.value === 'auto' ? 'auto' : Number(event.target.value))}>
+          <select className="settings-select" value={boardColumns} onChange={(event) => {
+            const value = event.target.value === 'auto' ? 'auto' : Number(event.target.value)
+            if (value === 'auto' && boardWidth === 'auto') {
+              setDisplaySettingNotice('看板个数和看板宽度不能同时设为自适应，请先将看板宽度改为固定宽度。')
+              return
+            }
+            setDisplaySettingNotice('')
+            onBoardColumnsChange(value)
+          }}>
             <option value="auto">自适应</option>
             {[3, 4, 5, 6, 7, 8].map((value) => <option key={value} value={value}>{value} 列</option>)}
           </select>
         </div>
         <div className="settings-row"><div><strong>看板宽度</strong><span>调整看板和卡片的横向空间</span></div>
-          <select className="settings-select" value={boardWidth} onChange={(event) => onBoardWidthChange(event.target.value as 'narrow' | 'medium' | 'wide')}>
-            <option value="narrow">窄</option><option value="medium">中</option><option value="wide">宽</option>
+          <select className="settings-select" value={boardWidth} onChange={(event) => {
+            const value = event.target.value as 'auto' | 'narrow' | 'medium' | 'wide'
+            if (value === 'auto' && boardColumns === 'auto') {
+              setDisplaySettingNotice('看板个数和看板宽度不能同时设为自适应，请先设置固定的每行看板列数。')
+              return
+            }
+            setDisplaySettingNotice('')
+            onBoardWidthChange(value)
+          }}>
+            <option value="auto">自适应</option><option value="narrow">窄</option><option value="medium">中</option><option value="wide">宽</option>
           </select>
         </div>
+        {displaySettingNotice && <div className="settings-display-notice" role="alert">{displaySettingNotice}</div>}
         <div className="settings-row"><div><strong>看板最大高度</strong><span>内容较少时自动收缩；拖拽看板下边缘可单独调整上限</span></div>
           <select className="settings-select" value={boardHeight} onChange={(event) => onBoardHeightChange(event.target.value as 'small' | 'medium' | 'large')}>
             <option value="small">小</option><option value="medium">中</option><option value="large">大</option>
@@ -2673,11 +3599,31 @@ function SettingsPage({ projectCount, boardCount, cardCount, projects, boards, s
           </div>
         </section>
         <section className="shortcut-section">
-          <header className="shortcut-section-title"><strong>应用内快捷键</strong><span>仅在 Vistask 窗口中生效，不可修改</span></header>
-          <div className="settings-row shortcut-reference-row"><div><strong>切换项目标签</strong><span>跳转到对应序号的项目，数字以项目在顶部的排列顺序为准</span></div><kbd>⌘ + 1…9</kbd></div>
-          <div className="settings-row shortcut-reference-row"><div><strong>进入项目主页</strong><span>无论当前在哪个页面，都返回项目主界面</span></div><kbd>⌘ + ⇧ + P</kbd></div>
-          <div className="settings-row shortcut-reference-row"><div><strong>进入 Tag 页面</strong><span>打开 Tag 管理与相关卡片页面</span></div><kbd>⌘ + ⇧ + T</kbd></div>
-          <div className="settings-row shortcut-reference-row"><div><strong>打开搜索</strong><span>打开全局搜索对话框</span></div><kbd>⌘ + ⇧ + F</kbd></div>
+          <header className="shortcut-section-title"><strong>应用内快捷键</strong><span>点击快捷键后，直接按下新的组合键</span></header>
+          {([
+            ['projectTabs', '切换项目标签', '跳转到对应序号的项目，数字以项目在顶部的排列顺序为准', 9],
+            ['planTabs', '切换计划标签', '在计划页面中切换日历、日程和过期标签', 3],
+            ['boards', '进入项目主页', '无论当前在哪个页面，都返回项目主界面'],
+            ['tags', '进入 Tag 页面', '打开 Tag 管理与相关卡片页面'],
+            ['settings', '进入设置页面', '打开应用设置页面'],
+            ['plan', '进入计划页面', '打开日历、日程和过期任务页面'],
+            ['search', '打开搜索', '打开全局搜索对话框'],
+            ['undo', '撤回', '撤回最近一次数据操作'],
+            ['redo', '重做', '重新执行刚才撤回的操作']
+          ] as Array<[AppShortcutKey, string, string, number?]>).map(([key, title, description, indexedMaximum]) =>
+            <div className="settings-row shortcut-settings-row" key={key}>
+              <div><strong>{title}</strong><span>{description}</span></div>
+              <div className="shortcut-control-wrap">
+                <button type="button" className={capturingAppShortcut === key ? 'shortcut-capture active' : 'shortcut-capture'}
+                  onClick={() => { setCapturingAppShortcut(key); setAppShortcutError('') }}
+                  onKeyDown={(event) => { if (capturingAppShortcut === key) captureAppShortcut(event, key, indexedMaximum) }}
+                  onBlur={() => { if (capturingAppShortcut === key) { setCapturingAppShortcut(null); setAppShortcutError('') } }}>
+                  {capturingAppShortcut === key ? (indexedMaximum ? `请按组合键 + 1…${indexedMaximum}` : '请按新的组合键…')
+                    : indexedMaximum ? formatIndexedShortcut(appShortcuts[key], indexedMaximum) : formatShortcut(appShortcuts[key])}
+                </button>
+                {capturingAppShortcut === key && appShortcutError && <span className="shortcut-error">{appShortcutError}</span>}
+              </div>
+            </div>)}
         </section>
       </div>
       : <div className="settings-panel">
@@ -2718,6 +3664,7 @@ interface BoardColumnProps {
   dragCardTargetId: string | null; dragCardTargetBoardId: string | null; dragBoardId: string | null; dragBoardTargetId: string | null
   heightMode: 'small' | 'medium' | 'large'
   parentDisplay: BoardParentDisplay; onParentDisplayChange: (display: BoardParentDisplay) => void
+  autoEditTitle: boolean; onAutoEditTitleComplete: () => void
   autoEditCardId: string | null; onAutoEditComplete: () => void
   childDisplaySelections: Record<string, ChildDisplay>; onSetChildDisplay: (cardId: string, display: ChildDisplay) => void
   onAddCard: (boardId: string, parentId?: string | null) => void; onEditCard: (card: BoardCard, anchor: DOMRect) => void
@@ -2729,6 +3676,73 @@ interface BoardColumnProps {
   onToggleCollapse: (cardId: string) => void; onDragStart: (cardId: string | null) => void
   onCardDragEnter: (boardId: string, beforeId?: string | null) => void
   onDropCard: (cardId: string, boardId: string, beforeId?: string | null) => void; onStartFocus: (cardId: string) => void
+}
+
+function TagProjectFilter({ projects, selectedIds, onChange }: {
+  projects: Project[]
+  selectedIds: Set<string>
+  onChange: (selectedIds: Set<string>) => void
+}): React.JSX.Element {
+  const [open, setOpen] = useState(false)
+  const [position, setPosition] = useState({ left: 8, top: 8 })
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const buttonRef = useRef<HTMLButtonElement | null>(null)
+  const popoverRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const close = (event: PointerEvent): void => {
+      const target = event.target as Node
+      if (!containerRef.current?.contains(target) && !popoverRef.current?.contains(target)) setOpen(false)
+    }
+    const closeOnViewportChange = (): void => setOpen(false)
+    document.addEventListener('pointerdown', close)
+    document.addEventListener('scroll', closeOnViewportChange, true)
+    window.addEventListener('resize', closeOnViewportChange)
+    return () => {
+      document.removeEventListener('pointerdown', close)
+      document.removeEventListener('scroll', closeOnViewportChange, true)
+      window.removeEventListener('resize', closeOnViewportChange)
+    }
+  }, [open])
+
+  function toggleOpen(): void {
+    if (open) { setOpen(false); return }
+    const rect = buttonRef.current?.getBoundingClientRect()
+    if (!rect) return
+    const width = 190
+    const estimatedHeight = Math.min(280, 42 + projects.length * 30)
+    setPosition({
+      left: Math.min(window.innerWidth - width - 8, Math.max(8, rect.right - width)),
+      top: rect.bottom + 6 + estimatedHeight <= window.innerHeight - 8 ? rect.bottom + 6 : Math.max(8, rect.top - estimatedHeight - 6)
+    })
+    setOpen(true)
+  }
+
+  function toggleProject(projectId: string): void {
+    const next = new Set(selectedIds)
+    if (next.has(projectId)) next.delete(projectId)
+    else next.add(projectId)
+    onChange(next)
+  }
+
+  const active = selectedIds.size > 0
+  return <div className="tag-project-filter" ref={containerRef}>
+    <button ref={buttonRef} className={active || open ? 'icon-button tag-project-filter-button active' : 'icon-button tag-project-filter-button'}
+      onClick={toggleOpen} title={active ? `已筛选 ${selectedIds.size} 个项目` : '项目筛选'} aria-label="项目筛选">
+      <ProjectOutlined />
+    </button>
+    {open && createPortal(<div ref={popoverRef} className="tag-project-filter-popover" style={position}
+      onPointerDown={(event) => event.stopPropagation()}>
+      <strong>项目</strong>
+      {projects.length ? projects.map((project) => <label key={project.id}>
+        <input type="checkbox" checked={selectedIds.has(project.id)} onChange={() => toggleProject(project.id)} />
+        <span className="tag-project-color" style={{ background: project.color }} />
+        <span>{project.title}</span>
+      </label>) : <small>暂无项目</small>}
+      <p>未选择表示全部项目</p>
+    </div>, document.body)}
+  </div>
 }
 
 function BoardDisplayAction({ value, managementOpen, onOpen, onChange }: {
@@ -2784,10 +3798,10 @@ function BoardDisplayAction({ value, managementOpen, onOpen, onChange }: {
   return <div className="board-display-action" ref={containerRef}>
     <button ref={buttonRef} className={open ? 'icon-button board-display-button active' : 'icon-button board-display-button'}
       onPointerDown={(event) => event.stopPropagation()} onDragStart={(event) => event.preventDefault()}
-      onClick={toggle} title="卡片显示类型" aria-label="卡片显示类型"><EyeIcon /></button>
-    {open && createPortal(<div ref={popoverRef} className="board-display-popover" style={position} role="radiogroup" aria-label="卡片显示类型"
+      onClick={toggle} title="卡片状态" aria-label="卡片状态"><EyeIcon /></button>
+    {open && createPortal(<div ref={popoverRef} className="board-display-popover" style={position} role="radiogroup" aria-label="卡片状态"
       onPointerDown={(event) => event.stopPropagation()}>
-      <strong>显示类型</strong>
+      <strong>卡片状态</strong>
       {options.map((option) => <label key={option.value}>
         <input type="radio" name="board-parent-display" value={option.value} checked={value === option.value}
           onChange={() => { onChange(option.value); setOpen(false) }} />
@@ -2834,6 +3848,13 @@ function BoardColumn(props: BoardColumnProps): React.JSX.Element {
   }, [])
   useEffect(() => { if (!renaming) setTitleDraft(board.title) }, [board.title, renaming])
   useEffect(() => { if (!props.manageOpen) setPendingBoardAction(null) }, [props.manageOpen])
+
+  useLayoutEffect(() => {
+    if (!props.autoEditTitle || props.virtual) return
+    cancelRenameRef.current = false
+    setTitleDraft(board.title)
+    setRenaming(true)
+  }, [board.id, board.title, props.autoEditTitle, props.virtual])
 
   useLayoutEffect(() => {
     if (!renaming) return
@@ -2958,12 +3979,14 @@ function BoardColumn(props: BoardColumnProps): React.JSX.Element {
       cancelRenameRef.current = false
       setTitleDraft(board.title)
       setRenaming(false)
+      if (props.autoEditTitle) props.onAutoEditTitleComplete()
       return
     }
     const title = titleDraft.trim()
     if (title && title !== board.title) props.onRename(title)
     if (!title) setTitleDraft(board.title)
     setRenaming(false)
+    if (props.autoEditTitle) props.onAutoEditTitleComplete()
   }
 
   const matchesParentDisplay = (card: BoardCard): boolean => props.virtual
@@ -2981,10 +4004,16 @@ function BoardColumn(props: BoardColumnProps): React.JSX.Element {
   const boardFocusMinutesText = Number.isInteger(boardFocusMinutes) ? String(boardFocusMinutes) : boardFocusMinutes.toFixed(1)
   const boardFocusTooltip = `${boardPomodoroCount.toFixed(1)}个番茄，共${boardFocusMinutesText}分钟`
   const hasCustomHeight = board.height !== null || resizing
-  return <article ref={articleRef} data-search-key={`board:${board.id}`} className={`board-column height-limited${hasCustomHeight ? ' custom-height' : ''}${contentExceedsMaximum ? ' content-overflowing' : ''}${props.dragBoardId === board.id ? ' dragging' : ''}${props.dragBoardTargetId === board.id ? ' drag-target' : ''}${props.dragCardId && props.dragCardTargetBoardId === board.id && props.dragCardTargetId === null ? ' card-drop-target' : ''}`}
+  return <article ref={articleRef} data-search-key={`board:${board.id}`} className={`board-column height-limited${props.virtual ? ' virtual-board' : ''}${hasCustomHeight ? ' custom-height' : ''}${contentExceedsMaximum ? ' content-overflowing' : ''}${props.dragBoardId === board.id ? ' dragging' : ''}${props.dragBoardTargetId === board.id ? ' drag-target' : ''}${props.dragCardId && props.dragCardTargetBoardId === board.id && props.dragCardTargetId === null ? ' card-drop-target' : ''}`}
     style={hasCustomHeight ? { height: `${previewHeight}px`, maxHeight: 'none' } : { maxHeight: `${previewHeight}px` }}
     onDragEnter={(event) => {
-      if (props.virtual) return
+      if (props.virtual) {
+        if (props.dragCardId && !(event.target as HTMLElement).closest('.card-item')) {
+          event.preventDefault()
+          props.onCardDragEnter(board.id, null)
+        }
+        return
+      }
       if (props.dragBoardId) {
         event.preventDefault()
         props.onBoardDragEnter(board.id)
@@ -2994,14 +4023,22 @@ function BoardColumn(props: BoardColumnProps): React.JSX.Element {
       }
     }}
     onDragOver={(event) => {
-      if (props.virtual) return
+      if (props.virtual) {
+        if (props.dragCardId) { event.preventDefault(); event.dataTransfer.dropEffect = 'move' }
+        return
+      }
       event.preventDefault()
       if (props.dragBoardId && props.dragBoardId !== board.id) {
         event.dataTransfer.dropEffect = 'move'
         props.onBoardDragEnter(board.id)
       }
     }} onDrop={(event) => {
-      if (props.virtual) return
+      if (props.virtual) {
+        event.preventDefault()
+        if (props.dragCardId) props.onDropCard(props.dragCardId, board.id)
+        props.onDragStart(null)
+        return
+      }
       event.preventDefault()
       const draggedBoardId = event.dataTransfer.getData('text/x-vistask-board')
       if (draggedBoardId) props.onBoardDrop(draggedBoardId, board.id)
@@ -3068,7 +4105,7 @@ function BoardColumn(props: BoardColumnProps): React.JSX.Element {
         </div>}
       </div>}
     </header>
-    <CardList {...props} aggregate={props.virtual} parentDisplay={props.virtual ? undefined : props.parentDisplay} disableDrag={props.virtual} />
+    <CardList {...props} aggregate={false} parentDisplay={props.virtual ? undefined : props.parentDisplay} disableDrag={false} />
     {props.virtual
       ? <button className="add-card virtual-placeholder" disabled aria-hidden="true" />
       : <button className="add-card" onClick={() => props.onAddCard(board.id)}>＋ 添加卡片</button>}
@@ -3091,6 +4128,7 @@ function BoardColumn(props: BoardColumnProps): React.JSX.Element {
 
 interface CardListProps {
   board: Board; tags: CardTag[]; collapsed: Set<string>; focus: FocusSession | null; dragCardId: string | null
+  virtual?: boolean
   dragCardTargetId: string | null; dragCardTargetBoardId: string | null
   parentDisplay?: BoardParentDisplay
   flat?: boolean
@@ -3165,8 +4203,8 @@ function CardList(props: CardListProps): React.JSX.Element {
         assignmentProjects={props.assignmentProjects} assignmentBoards={props.assignmentBoards}
         onAssign={props.onAssignCard ? (targetBoardId) => props.onAssignCard?.(card, targetBoardId) : undefined}
         onStartFocus={() => props.onStartFocus(card.id)} onDragStart={() => props.onDragStart(card.id)} onDragEnd={() => props.onDragStart(null)}
-        onDragEnter={() => props.onCardDragEnter(card.boardId, card.id)}
-        onDrop={() => { if (props.dragCardId) props.onDropCard(props.dragCardId, card.boardId, card.id); props.onDragStart(null) }}>
+        onDragEnter={() => props.onCardDragEnter(props.virtual ? board.id : card.boardId, card.id)}
+        onDrop={() => { if (props.dragCardId) props.onDropCard(props.dragCardId, props.virtual ? board.id : card.boardId, card.id); props.onDragStart(null) }}>
         {children.length > 0 && <div className="subcards-list">
           {children.map((child) => <CardItem key={child.id} card={child} isChild childCount={0} embedded
             tags={props.tags}
@@ -3188,8 +4226,8 @@ function CardList(props: CardListProps): React.JSX.Element {
             assignmentProjects={props.assignmentProjects} assignmentBoards={props.assignmentBoards}
             onAssign={props.onAssignCard ? (targetBoardId) => props.onAssignCard?.(child, targetBoardId) : undefined}
             onStartFocus={() => props.onStartFocus(child.id)} onDragStart={() => props.onDragStart(child.id)} onDragEnd={() => props.onDragStart(null)}
-            onDragEnter={() => props.onCardDragEnter(child.boardId, child.id)}
-            onDrop={() => { if (props.dragCardId) props.onDropCard(props.dragCardId, child.boardId, child.id); props.onDragStart(null) }} />)}
+            onDragEnter={() => props.onCardDragEnter(props.virtual ? board.id : child.boardId, child.id)}
+            onDrop={() => { if (props.dragCardId) props.onDropCard(props.dragCardId, props.virtual ? board.id : child.boardId, child.id); props.onDragStart(null) }} />)}
         </div>}
       </CardItem>
     })}
@@ -3258,9 +4296,9 @@ function ChildDisplayAction({ value, mode, onChange }: { value: ChildDisplay; mo
 
   return <div className="child-display-action" ref={containerRef}>
     <button ref={buttonRef} className={open ? 'child-display-button active' : 'child-display-button'} onClick={toggle}
-      data-tooltip="子卡片显示类型" aria-label="子卡片显示类型"><EyeIcon /></button>
-    {open && createPortal(<div ref={popoverRef} className="child-display-popover" style={position} role="radiogroup" aria-label="子卡片显示类型" onPointerDown={(event) => event.stopPropagation()}>
-      <strong>子卡片显示类型</strong>
+      data-tooltip="子卡片状态" aria-label="子卡片状态"><EyeIcon /></button>
+    {open && createPortal(<div ref={popoverRef} className="child-display-popover" style={position} role="radiogroup" aria-label="子卡片状态" onPointerDown={(event) => event.stopPropagation()}>
+      <strong>子卡片状态</strong>
       {options.map((option) => <label key={option}>
         <input type="radio" name="child-display" value={option} checked={displayValue === option} onChange={() => { onChange(option); setOpen(false) }} />
         <span>{option === 'in_progress' && mode === 'serial' ? '进行中-所有' : CHILD_DISPLAY_LABELS[option]}</span>
@@ -3630,7 +4668,7 @@ function CardItem(props: CardItemProps): React.JSX.Element {
     </div>}
     <div className="card-actions">
       <div className="card-actions-left">
-        {!props.isChild && <button className="card-action-button icon-only" onClick={props.onAddChild} data-tooltip="添加子卡片" aria-label="添加子卡片"><CardActionIcon name="child" /></button>}
+        {!props.isChild && <button className="card-action-button child-action-button icon-only" onClick={props.onAddChild} data-tooltip="添加子卡片" aria-label="添加子卡片"><SubnodeOutlined /></button>}
         {props.onAssign && props.assignmentProjects && props.assignmentBoards && <AssignmentAction
           projects={props.assignmentProjects} boards={props.assignmentBoards} onAssign={props.onAssign} />}
         <button className="card-action-button icon-only content-action" onClick={(event) => startContentEdit(event.currentTarget)} data-tooltip="编辑内容" aria-label="编辑内容"><CardTextIcon /></button>
@@ -3693,40 +4731,48 @@ export function QuickInboxWindow(): React.JSX.Element {
   </div>
 }
 
-function TagManager({ tags, selectedTagId, onSelect, onAdd, onDelete, onReorder }: {
+function TagManager({ tags, selectedTagId, onSelect, onAdd, onRename, onDelete, onReorder }: {
   tags: CardTag[]
   selectedTagId: string | null
   onSelect: (tagId: string) => void
-  onAdd: (parentId: string | null, title: string) => void
+  onAdd: (parentId: string | null, title: string) => string | null
+  onRename: (tagId: string, title: string) => void
   onDelete: (tagId: string) => void
   onReorder: (draggedId: string, targetId: string) => void
 }): React.JSX.Element {
-  const [adding, setAdding] = useState<{ parentId: string | null; depth: number } | null>(null)
-  const [draft, setDraft] = useState('')
+  const [editingTagId, setEditingTagId] = useState<string | null>(null)
+  const [titleDraft, setTitleDraft] = useState('')
   const [draggedTagId, setDraggedTagId] = useState<string | null>(null)
   const [dragTargetTagId, setDragTargetTagId] = useState<string | null>(null)
+  const titleInputRef = useRef<HTMLInputElement | null>(null)
   const childrenOf = (parentId: string | null): CardTag[] => tags.filter((tag) => tag.parentId === parentId).sort((a, b) => a.sort - b.sort)
-  const beginAdd = (parentId: string | null, depth: number): void => {
-    setDraft('')
-    setAdding({ parentId, depth })
+
+  useLayoutEffect(() => {
+    if (!editingTagId) return
+    const input = titleInputRef.current
+    if (!input) return
+    input.focus()
+    input.select()
+  }, [editingTagId])
+
+  const addAndEdit = (parentId: string | null): void => {
+    const tagId = onAdd(parentId, '未命名 Tag')
+    if (!tagId) return
+    setTitleDraft('未命名 Tag')
+    setEditingTagId(tagId)
   }
-  const submit = (): void => {
-    const title = draft.trim()
-    if (!adding || !title) return
-    onAdd(adding.parentId, title)
-    setAdding(null)
-    setDraft('')
+
+  const finishEditing = (): void => {
+    if (!editingTagId) return
+    const tag = tags.find((item) => item.id === editingTagId)
+    const title = titleDraft.trim() || tag?.title || '未命名 Tag'
+    onRename(editingTagId, title)
+    setEditingTagId(null)
+    setTitleDraft('')
   }
-  const renderEditor = (parentId: string | null, depth: number): React.ReactNode => adding?.parentId === parentId
-    ? <div className="tag-tree-editor" style={{ '--tag-depth': depth } as React.CSSProperties}>
-      <input autoFocus value={draft} maxLength={40} placeholder={parentId ? '子 Tag 名称' : 'Tag 名称'}
-        onChange={(event) => setDraft(event.target.value)}
-        onKeyDown={(event) => { if (event.key === 'Enter') submit(); if (event.key === 'Escape') setAdding(null) }} />
-      <button className="confirm" disabled={!draft.trim()} onClick={submit}>添加</button>
-      <button onClick={() => setAdding(null)}>取消</button>
-    </div> : null
+
   const renderBranch = (parentId: string | null, depth: number): React.ReactNode => childrenOf(parentId).map((tag) => <div className="tag-tree-branch" key={tag.id}>
-    <div draggable className={`tag-tree-row${selectedTagId === tag.id ? ' active' : ''}${draggedTagId === tag.id ? ' dragging' : ''}${dragTargetTagId === tag.id ? ' drag-target' : ''}`}
+    <div draggable={editingTagId !== tag.id} className={`tag-tree-row${selectedTagId === tag.id ? ' active' : ''}${draggedTagId === tag.id ? ' dragging' : ''}${dragTargetTagId === tag.id ? ' drag-target' : ''}`}
       style={{ '--tag-depth': depth } as React.CSSProperties}
       onDragStart={(event) => {
         event.dataTransfer.effectAllowed = 'move'
@@ -3754,16 +4800,23 @@ function TagManager({ tags, selectedTagId, onSelect, onAdd, onDelete, onReorder 
       }}
       onDrop={(event) => { event.preventDefault(); setDraggedTagId(null); setDragTargetTagId(null) }}
       onDragEnd={() => { setDraggedTagId(null); setDragTargetTagId(null) }}>
-      <button className="tag-tree-select" onClick={() => onSelect(tag.id)}>{childrenOf(tag.id).length ? <TagsOutlined /> : <TagOutlined />} <span>{tag.title}</span></button>
+      {editingTagId === tag.id
+        ? <div className="tag-tree-select tag-tree-inline-editor">
+          {childrenOf(tag.id).length ? <TagsOutlined /> : <TagOutlined />}
+          <input ref={titleInputRef} value={titleDraft} maxLength={40} aria-label="Tag 名称"
+            onChange={(event) => setTitleDraft(event.target.value)}
+            onBlur={finishEditing}
+            onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }} />
+        </div>
+        : <button className="tag-tree-select" onClick={() => onSelect(tag.id)}>{childrenOf(tag.id).length ? <TagsOutlined /> : <TagOutlined />} <span>{tag.title}</span></button>}
       <button className="tag-tree-delete" onClick={() => onDelete(tag.id)} title="删除 Tag" aria-label={`删除 ${tag.title}`}>×</button>
-      {depth < 3 && <button className="tag-tree-add-child" onClick={() => beginAdd(tag.id, depth + 1)} title="新增子 Tag" aria-label={`为 ${tag.title} 新增子 Tag`}>＋</button>}
+      {depth < 3 && <button className="tag-tree-add-child" onClick={() => addAndEdit(tag.id)} title="新增子 Tag" aria-label={`为 ${tag.title} 新增子 Tag`}>＋</button>}
     </div>
-    {renderEditor(tag.id, depth + 1)}
     {renderBranch(tag.id, depth + 1)}
   </div>)
   return <aside className="tag-manager">
-    <header><div><h2>Tag 管理</h2></div><button className="tag-add-root" onClick={() => beginAdd(null, 1)} title="新增 Tag" aria-label="新增 Tag">＋</button></header>
-    <div className="tag-tree">{renderEditor(null, 1)}{tags.length ? renderBranch(null, 1) : !adding && <div className="tag-tree-empty">暂无 Tag</div>}</div>
+    <header><div><h2>Tag 管理</h2></div><button className="tag-add-root" onClick={() => addAndEdit(null)} title="新增 Tag" aria-label="新增 Tag">＋</button></header>
+    <div className="tag-tree">{tags.length ? renderBranch(null, 1) : <div className="tag-tree-empty">暂无 Tag</div>}</div>
   </aside>
 }
 

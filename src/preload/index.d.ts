@@ -60,9 +60,15 @@ declare global {
   }
 
   interface TagViewConfig {
-    enabled: boolean
+    id: string
+    pinned: boolean
     categoryTagId: string
     statuses: BoardFilter
+  }
+
+  interface ProjectTagViewSettings {
+    activeViewId: string | null
+    views: TagViewConfig[]
   }
 
   interface Board {
@@ -87,6 +93,37 @@ declare global {
     running: boolean
   }
 
+  interface ThemePalette {
+    color: string
+    projectBrightness: number
+    boardBrightness: number
+    cardBrightness: number
+  }
+
+  interface SavedTheme extends ThemePalette {
+    id: string
+    title: string
+  }
+
+  interface ThemeSettings {
+    activeThemeId: string
+    customDraft: ThemePalette
+    themes: SavedTheme[]
+  }
+
+  interface ShortcutSettings {
+    inbox: string
+    projectTabs: string
+    planTabs: string
+    boards: string
+    tags: string
+    settings: string
+    plan: string
+    search: string
+    undo: string
+    redo: string
+  }
+
   interface BoardState {
     version: 1
     projects: Project[]
@@ -94,18 +131,20 @@ declare global {
     boards: Board[]
     focus: FocusSession | null
     lastProjectId: string | null
+    lastView: 'boards' | 'inbox' | 'flagged' | 'overdue' | 'tags' | 'statistics' | 'settings'
     boardDisplaySettings: Record<string, 'all' | 'in_progress' | 'staged' | 'done'>
-    tagViewSettings: Record<string, TagViewConfig>
+    tagViewSettings: Record<string, ProjectTagViewSettings>
+    themeSettings: ThemeSettings
     displaySettings: {
       boardColumns: number | 'auto'
-      boardWidth: 'narrow' | 'medium' | 'wide'
+      boardWidth: 'auto' | 'narrow' | 'medium' | 'wide'
       boardHeight: 'small' | 'medium' | 'large'
       fontSize: 'small' | 'medium' | 'large'
       dockTimerEnabled: boolean
     }
-    inboxSettings: { in_progress: boolean; done: boolean; deleted: boolean }
+    inboxSettings: { staged: boolean; in_progress: boolean; done: boolean; deleted: boolean }
     focusSettings: { durationMinutes: number }
-    shortcuts: { inbox: string }
+    shortcuts: ShortcutSettings
   }
 
   interface DatabaseInfo {
@@ -132,6 +171,7 @@ declare global {
       getSystemInfo: () => Promise<SystemInfo>
       setDockIcon: (dataUrl: string) => Promise<boolean>
       setDockFocusState: (state: 'none' | 'running' | 'paused') => Promise<boolean>
+      setStatusBarFocus: (focus: { running: boolean; endsAt: number; remainingMs: number } | null) => Promise<boolean>
       onDockFocusAction: (callback: (action: 'pause' | 'resume') => void) => () => void
       startShortcutCapture: () => Promise<boolean>
       cancelShortcutCapture: () => Promise<boolean>

@@ -12,6 +12,7 @@ const api = {
   getSystemInfo: (): Promise<SystemInfo> => ipcRenderer.invoke('app:get-system-info'),
   setDockIcon: (dataUrl: string): Promise<boolean> => ipcRenderer.invoke('app:set-dock-icon', dataUrl),
   setDockFocusState: (state: 'none' | 'running' | 'paused'): Promise<boolean> => ipcRenderer.invoke('focus:set-dock-state', state),
+  setStatusBarFocus: (focus: { running: boolean; endsAt: number; remainingMs: number } | null): Promise<boolean> => ipcRenderer.invoke('focus:set-status-bar', focus),
   onDockFocusAction: (callback: (action: 'pause' | 'resume') => void): (() => void) => {
     const listener = (_event: Electron.IpcRendererEvent, action: 'pause' | 'resume'): void => callback(action)
     ipcRenderer.on('focus:dock-action', listener)
